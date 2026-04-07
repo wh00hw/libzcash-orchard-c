@@ -33,6 +33,8 @@ set(CRYPTO_SOURCES
 
 set(PROTOCOL_SOURCES
     src/hwp.c
+    src/zip244.c
+    src/orchard_signer.c
 )
 
 # --- Static library ---

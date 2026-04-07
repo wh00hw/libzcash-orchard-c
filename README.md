@@ -11,6 +11,8 @@ Implements key derivation, address generation, RedPallas signing, and a binary s
 - **ZIP-32 key derivation** — master key from BIP39 seed, hardened child derivation (`m_Orchard / 32' / coin_type' / account'`)
 - **Orchard Unified Addresses** — full derivation with F4Jumble (ZIP-316) and Bech32m encoding
 - **Pallas / RedPallas** — curve arithmetic, Sinsemilla hash, spend authorization signing
+- **ZIP-244 sighash verification** — on-device computation of the full v5 shielded sighash (header, orchard actions digest with compact/memos/noncompact sub-hashes)
+- **Signing context** (`orchard_signer.h`) — library-level invariant that refuses to sign unless ZIP-244 verification has passed; firmware cannot bypass this
 - **Hardware Wallet Protocol v2** — framed binary serial protocol with CRC-16, incremental sighash verification, compatible with [zcash-hw-wallet-sdk](https://github.com/wh00hw/zcash-hw-wallet-sdk) (Rust)
 - **BIP39 mnemonic** — generation and seed derivation (PBKDF2-HMAC-SHA512)
 - **Crypto primitives** — BLAKE2b, SHA-256/512, HMAC, PBKDF2, AES-256 (FF1), all in pure C
@@ -208,6 +210,8 @@ include/
   redpallas.h      — RedPallas spend authorization signing
   pallas.h         — Pallas curve arithmetic, Sinsemilla hash
   hwp.h            — Hardware Wallet Protocol v2 (serial framing)
+  zip244.h         — ZIP-244 v5 shielded sighash computation
+  orchard_signer.h — Signing context with mandatory sighash verification
   bip39.h          — BIP39 mnemonic generation
   bignum.h         — 256-bit big number arithmetic
   blake2b.h        — BLAKE2b hash
@@ -230,6 +234,40 @@ src/
 | `pallas_set_sinsemilla_lookup()` | Runtime callback | Fast Sinsemilla from storage |
 | `pallas_set_progress_cb()` | Runtime callback | UI progress during key derivation |
 | `pallas_set_yield_cb()` | Runtime callback | Watchdog / RTOS yield |
+
+## ZIP-244 On-Device Sighash Verification
+
+The library includes a signing context (`orchard_signer.h`) that enforces ZIP-244 sighash verification as a library-level invariant: `orchard_signer_sign()` **refuses to produce a signature** unless the sighash has been verified first. Firmware cannot bypass this check.
+
+The verification flow works incrementally:
+
+1. **Metadata** — companion sends transaction header + Orchard bundle info (125 bytes)
+2. **Actions** — companion sends each action's full ZIP-244 data (820 bytes each), hashed incrementally into compact, memos, and non-compact sub-digests
+3. **Sentinel** — companion sends the expected sighash; the device computes its own from the metadata + action digests and compares
+
+### Trust model for non-Orchard digests
+
+The device only has access to the Orchard bundle. The transparent signature digest and sapling digest are **pre-computed by the companion** and included in the `TxMeta` wire format. This is the standard approach for Zcash hardware wallets (same as Ledger). The trust model is sound: if the companion falsifies these digests, the resulting sighash won't match the real transaction, and the on-chain signature verification will fail. There is no benefit for a malicious companion to lie about these values.
+
+```c
+#include "orchard_signer.h"
+
+OrchardSignerCtx ctx;
+orchard_signer_init(&ctx);
+
+// 1. Feed metadata (from companion TxOutput with index 0xFFFF)
+orchard_signer_feed_meta(&ctx, meta_bytes, 125, num_actions);
+
+// 2. Feed each action (820 bytes)
+for (int i = 0; i < num_actions; i++)
+    orchard_signer_feed_action(&ctx, action_data[i], 820);
+
+// 3. Verify sighash
+orchard_signer_verify(&ctx, expected_sighash);  // SIGNER_ERR_SIGHASH_MISMATCH on failure
+
+// 4. Sign (only succeeds if verified)
+orchard_signer_sign(&ctx, sighash, ask, alpha, sig, rk);  // SIGNER_ERR_NOT_VERIFIED if step 3 was skipped
+```
 
 ## Known limitations
 

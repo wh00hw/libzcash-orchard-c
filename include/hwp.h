@@ -3,7 +3,7 @@
  *
  * Frame: [MAGIC:1][VERSION:1][SEQ:1][TYPE:1][LENGTH:2 LE][PAYLOAD:N][CRC16:2 LE]
  *
- * Compatible with zcash-hw-signer-sdk (Rust).
+ * Compatible with zcash-hw-wallet-sdk (Rust).
  * Supports staged transaction verification: outputs are sent individually
  * and hashed incrementally on-device to verify sighash integrity before signing.
  */
@@ -17,8 +17,18 @@
 
 #define HWP_HEADER_SIZE   6
 #define HWP_CRC_SIZE      2
-#define HWP_MAX_PAYLOAD   512
-#define HWP_MAX_FRAME     (HWP_HEADER_SIZE + HWP_MAX_PAYLOAD + HWP_CRC_SIZE) // 520
+#define HWP_MAX_PAYLOAD   1024
+#define HWP_MAX_FRAME     (HWP_HEADER_SIZE + HWP_MAX_PAYLOAD + HWP_CRC_SIZE) // 1032
+
+// Action data size per TxOutput message (v2 sighash verification):
+// cv_net(32) + nullifier(32) + rk(32) + cmx(32) + ephemeral_key(32) + enc_ciphertext(580) + out_ciphertext(80)
+#define HWP_ACTION_DATA_SIZE 820
+
+// TxOutput special indices for v2 sighash verification protocol:
+// 0xFFFF = transaction metadata (header + orchard bundle info, 61 bytes)
+// 0..N-1 = action data (820 bytes each)
+// N      = sentinel (expected 32-byte sighash for comparison)
+#define HWP_TX_META_INDEX 0xFFFF
 
 // --- Message types (matches zcash-hw-signer-sdk MsgType) ---
 typedef enum {
