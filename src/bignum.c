@@ -21,6 +21,9 @@
  * OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
  * ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
  * OTHER DEALINGS IN THE SOFTWARE.
+ *
+ * Modified: bn_inverse locals moved to static storage for 4 KB stack
+ * budget on embedded targets (Flipper Zero, Cortex-M).
  */
 
 #include "bignum.h"
@@ -1118,13 +1121,17 @@ static void bn_inverse_fast(bignum256* x, const bignum256* prime) {
     bn_fast_mod(x, prime);
     bn_mod(x, prime);
 
-    bignum256 u = {0}, v = {0}, r = {0}, s = {0};
+    static bignum256 u, v, r, s, zero;
+    memset(&u, 0, sizeof(u));
+    memset(&v, 0, sizeof(v));
+    memset(&r, 0, sizeof(r));
+    memset(&s, 0, sizeof(s));
     bn_copy(prime, &u);
     bn_copy(x, &v);
     bn_one(&s);
     bn_zero(&r);
 
-    bignum256 zero = {0};
+    memset(&zero, 0, sizeof(zero));
     bn_zero(&zero);
 
     int k = 0;

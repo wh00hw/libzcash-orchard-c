@@ -26,6 +26,9 @@
  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
  * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
+ *
+ * Modified: local variables moved to static storage for 4 KB stack
+ * budget on embedded targets (Flipper Zero, Cortex-M).
  */
 
 #include <string.h>
@@ -402,10 +405,13 @@ void sha1_Transform(const sha2_word32* state_in, const sha2_word32* data, sha2_w
 
 #else /* SHA2_UNROLL_TRANSFORM */
 
+__attribute__((noinline))
 void sha1_Transform(const sha2_word32* state_in, const sha2_word32* data, sha2_word32* state_out) {
-    sha2_word32 a = 0, b = 0, c = 0, d = 0, e = 0;
-    sha2_word32 T1 = 0;
-    sha2_word32 W1[16] = {0};
+    static sha2_word32 a, b, c, d, e;
+    static sha2_word32 T1;
+    static sha2_word32 W1[16];
+    a = b = c = d = e = T1 = 0;
+    memzero(W1, sizeof(W1));
     int j = 0;
 
     /* Initialize registers with the prev. intermediate value */
@@ -482,6 +488,7 @@ void sha1_Transform(const sha2_word32* state_in, const sha2_word32* data, sha2_w
 
 #endif /* SHA2_UNROLL_TRANSFORM */
 
+__attribute__((noinline))
 void sha1_Update(SHA1_CTX* context, const sha2_byte* data, size_t len) {
     unsigned int freespace = 0, usedspace = 0;
 
@@ -540,6 +547,7 @@ void sha1_Update(SHA1_CTX* context, const sha2_byte* data, size_t len) {
     usedspace = freespace = 0;
 }
 
+__attribute__((noinline))
 void sha1_Final(SHA1_CTX* context, sha2_byte digest[SHA1_DIGEST_LENGTH]) {
     unsigned int usedspace = 0;
 
@@ -594,8 +602,11 @@ void sha1_Final(SHA1_CTX* context, sha2_byte digest[SHA1_DIGEST_LENGTH]) {
     usedspace = 0;
 }
 
+__attribute__((noinline))
 char* sha1_End(SHA1_CTX* context, char buffer[SHA1_DIGEST_STRING_LENGTH]) {
-    sha2_byte digest[SHA1_DIGEST_LENGTH] = {0}, *d = digest;
+    static sha2_byte digest[SHA1_DIGEST_LENGTH];
+    memzero(digest, sizeof(digest));
+    sha2_byte *d = digest;
     int i = 0;
 
     if(buffer != (char*)0) {
@@ -614,16 +625,19 @@ char* sha1_End(SHA1_CTX* context, char buffer[SHA1_DIGEST_STRING_LENGTH]) {
     return buffer;
 }
 
+__attribute__((noinline))
 void sha1_Raw(const sha2_byte* data, size_t len, uint8_t digest[SHA1_DIGEST_LENGTH]) {
-    SHA1_CTX context = {0};
+    static SHA1_CTX context;
+    memzero(&context, sizeof(context));
     sha1_Init(&context);
     sha1_Update(&context, data, len);
     sha1_Final(&context, digest);
 }
 
+__attribute__((noinline))
 char* sha1_Data(const sha2_byte* data, size_t len, char digest[SHA1_DIGEST_STRING_LENGTH]) {
-    SHA1_CTX context = {0};
-
+    static SHA1_CTX context;
+    memzero(&context, sizeof(context));
     sha1_Init(&context);
     sha1_Update(&context, data, len);
     return sha1_End(&context, digest);
@@ -726,9 +740,12 @@ void sha256_Transform(const sha2_word32* state_in, const sha2_word32* data, sha2
 
 #else /* SHA2_UNROLL_TRANSFORM */
 
+__attribute__((noinline))
 void sha256_Transform(const sha2_word32* state_in, const sha2_word32* data, sha2_word32* state_out) {
-    sha2_word32 a = 0, b = 0, c = 0, d = 0, e = 0, f = 0, g = 0, h = 0, s0 = 0, s1 = 0;
-    sha2_word32 T1 = 0, T2 = 0, W256[16] = {0};
+    static sha2_word32 a, b, c, d, e, f, g, h, s0, s1;
+    static sha2_word32 T1, T2, W256[16];
+    a = b = c = d = e = f = g = h = s0 = s1 = T1 = T2 = 0;
+    memzero(W256, sizeof(W256));
     int j = 0;
 
     /* Initialize registers with the prev. intermediate value */
@@ -797,6 +814,7 @@ void sha256_Transform(const sha2_word32* state_in, const sha2_word32* data, sha2
 
 #endif /* SHA2_UNROLL_TRANSFORM */
 
+__attribute__((noinline))
 void sha256_Update(SHA256_CTX* context, const sha2_byte* data, size_t len) {
     unsigned int freespace = 0, usedspace = 0;
 
@@ -855,6 +873,7 @@ void sha256_Update(SHA256_CTX* context, const sha2_byte* data, size_t len) {
     usedspace = freespace = 0;
 }
 
+__attribute__((noinline))
 void sha256_Final(SHA256_CTX* context, sha2_byte digest[SHA256_DIGEST_LENGTH]) {
     unsigned int usedspace = 0;
 
@@ -909,8 +928,11 @@ void sha256_Final(SHA256_CTX* context, sha2_byte digest[SHA256_DIGEST_LENGTH]) {
     usedspace = 0;
 }
 
+__attribute__((noinline))
 char* sha256_End(SHA256_CTX* context, char buffer[SHA256_DIGEST_STRING_LENGTH]) {
-    sha2_byte digest[SHA256_DIGEST_LENGTH] = {0}, *d = digest;
+    static sha2_byte digest[SHA256_DIGEST_LENGTH];
+    memzero(digest, sizeof(digest));
+    sha2_byte *d = digest;
     int i = 0;
 
     if(buffer != (char*)0) {
@@ -929,16 +951,19 @@ char* sha256_End(SHA256_CTX* context, char buffer[SHA256_DIGEST_STRING_LENGTH]) 
     return buffer;
 }
 
+__attribute__((noinline))
 void sha256_Raw(const sha2_byte* data, size_t len, uint8_t digest[SHA256_DIGEST_LENGTH]) {
-    SHA256_CTX context = {0};
+    static SHA256_CTX context;
+    memzero(&context, sizeof(context));
     sha256_Init(&context);
     sha256_Update(&context, data, len);
     sha256_Final(&context, digest);
 }
 
+__attribute__((noinline))
 char* sha256_Data(const sha2_byte* data, size_t len, char digest[SHA256_DIGEST_STRING_LENGTH]) {
-    SHA256_CTX context = {0};
-
+    static SHA256_CTX context;
+    memzero(&context, sizeof(context));
     sha256_Init(&context);
     sha256_Update(&context, data, len);
     return sha256_End(&context, digest);
@@ -1029,9 +1054,12 @@ void sha512_Transform(const sha2_word64* state_in, const sha2_word64* data, sha2
 
 #else /* SHA2_UNROLL_TRANSFORM */
 
+__attribute__((noinline))
 void sha512_Transform(const sha2_word64* state_in, const sha2_word64* data, sha2_word64* state_out) {
-    sha2_word64 a = 0, b = 0, c = 0, d = 0, e = 0, f = 0, g = 0, h = 0, s0 = 0, s1 = 0;
-    sha2_word64 T1 = 0, T2 = 0, W512[16] = {0};
+    static sha2_word64 a, b, c, d, e, f, g, h, s0, s1;
+    static sha2_word64 T1, T2, W512[16];
+    a = b = c = d = e = f = g = h = s0 = s1 = T1 = T2 = 0;
+    memzero(W512, sizeof(W512));
     int j = 0;
 
     /* Initialize registers with the prev. intermediate value */
@@ -1100,6 +1128,7 @@ void sha512_Transform(const sha2_word64* state_in, const sha2_word64* data, sha2
 
 #endif /* SHA2_UNROLL_TRANSFORM */
 
+__attribute__((noinline))
 void sha512_Update(SHA512_CTX* context, const sha2_byte* data, size_t len) {
     unsigned int freespace = 0, usedspace = 0;
 
@@ -1158,6 +1187,7 @@ void sha512_Update(SHA512_CTX* context, const sha2_byte* data, size_t len) {
     usedspace = freespace = 0;
 }
 
+__attribute__((noinline))
 static void sha512_Last(SHA512_CTX* context) {
     unsigned int usedspace = 0;
 
@@ -1197,6 +1227,7 @@ static void sha512_Last(SHA512_CTX* context) {
     sha512_Transform(context->state, context->buffer, context->state);
 }
 
+__attribute__((noinline))
 void sha512_Final(SHA512_CTX* context, sha2_byte digest[SHA512_DIGEST_LENGTH]) {
     /* If no digest buffer is passed, we don't bother doing this: */
     if(digest != (sha2_byte*)0) {
@@ -1216,8 +1247,11 @@ void sha512_Final(SHA512_CTX* context, sha2_byte digest[SHA512_DIGEST_LENGTH]) {
     memzero(context, sizeof(SHA512_CTX));
 }
 
+__attribute__((noinline))
 char* sha512_End(SHA512_CTX* context, char buffer[SHA512_DIGEST_STRING_LENGTH]) {
-    sha2_byte digest[SHA512_DIGEST_LENGTH] = {0}, *d = digest;
+    static sha2_byte digest[SHA512_DIGEST_LENGTH];
+    memzero(digest, sizeof(digest));
+    sha2_byte *d = digest;
     int i = 0;
 
     if(buffer != (char*)0) {
@@ -1236,16 +1270,19 @@ char* sha512_End(SHA512_CTX* context, char buffer[SHA512_DIGEST_STRING_LENGTH]) 
     return buffer;
 }
 
+__attribute__((noinline))
 void sha512_Raw(const sha2_byte* data, size_t len, uint8_t digest[SHA512_DIGEST_LENGTH]) {
-    SHA512_CTX context = {0};
+    static SHA512_CTX context;
+    memzero(&context, sizeof(context));
     sha512_Init(&context);
     sha512_Update(&context, data, len);
     sha512_Final(&context, digest);
 }
 
+__attribute__((noinline))
 char* sha512_Data(const sha2_byte* data, size_t len, char digest[SHA512_DIGEST_STRING_LENGTH]) {
-    SHA512_CTX context = {0};
-
+    static SHA512_CTX context;
+    memzero(&context, sizeof(context));
     sha512_Init(&context);
     sha512_Update(&context, data, len);
     return sha512_End(&context, digest);

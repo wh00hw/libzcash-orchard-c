@@ -8,6 +8,11 @@ project(zcash-orchard-c
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# Use -O2 instead of CMake's default -O3 for Release builds.
+# GCC ≥13 with -O3 applies aggressive loop unrolling in SHA-2 that
+# inflates stack frames beyond the 512-byte embedded budget.
+set(CMAKE_C_FLAGS_RELEASE "-O2 -DNDEBUG")
+
 # --- Library sources ---
 
 set(CRYPTO_SOURCES
@@ -56,6 +61,7 @@ target_include_directories(zcash-orchard-c
 target_compile_options(zcash-orchard-c PRIVATE
     -Wall -Wextra -Wno-unused-parameter
 )
+
 
 # --- Install ---
 
