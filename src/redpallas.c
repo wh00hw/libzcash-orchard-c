@@ -139,15 +139,33 @@ static void generate_nonce(bignum256* nonce, const uint8_t rsk_bytes[32], const 
 void redpallas_derive_ak(const uint8_t ask[32], uint8_t ak_out[32]) {
     pallas_init();
 
-    bignum256 ask_bn;
+    // Static to reduce stack pressure on constrained devices
+    static bignum256 ask_bn;
+    static pallas_point G_spend, ak;
+
     bn_read_le(ask, &ask_bn);
     fq_full_reduce(&ask_bn);
 
-    pallas_point G_spend;
     pallas_group_hash(&G_spend, "z.cash:Orchard", (const uint8_t*)"G", 1);
 
-    pallas_point ak;
     pallas_point_mul(&ak, &ask_bn, &G_spend);
+
+    // Orchard protocol §4.2.3: SpendValidatingKey is normalized so that
+    // the sign bit of the encoded ak is 0. If [ask]*G has sign bit 1,
+    // we negate the point (which is equivalent to using -ask).
+    // This matches the orchard crate's SpendAuthorizingKey::from().
+    {
+        static bignum256 y_reduced, neg_y;
+        bn_copy(&ak.y, &y_reduced);
+        bn_mod(&y_reduced, pallas_p());
+        if(y_reduced.val[0] & 1) {
+            bn_subtract(pallas_p(), &y_reduced, &neg_y);
+            bn_copy(&neg_y, &ak.y);
+            memzero(&neg_y, sizeof(neg_y));
+        }
+        memzero(&y_reduced, sizeof(y_reduced));
+    }
+
     pallas_point_encode(ak_out, &ak);
 
     memzero(&ask_bn, sizeof(ask_bn));
@@ -164,8 +182,19 @@ int redpallas_sign(
 
     pallas_init();
 
+    // Large structures are static to avoid ~880 bytes of stack pressure.
+    // Ledger Nano S+ has only ~6KB stack; without this, the nested call
+    // chain (sample_main -> signer -> sign -> group_hash -> hash_to_curve)
+    // overflows. All statics are explicitly zeroed after use.
+    static bignum256 ask_bn, alpha_bn, rsk, nonce;
+    static bignum256 challenge, c_times_rsk, S_scalar;
+    static pallas_point G_spend, rk, R;
+    static blake2b_state S_hash;
+    static uint8_t challenge_raw[64];
+    static uint8_t R_bytes[32];
+    static uint8_t rsk_bytes[32];
+
     // Load scalars
-    bignum256 ask_bn, alpha_bn, rsk;
     bn_read_le(ask, &ask_bn);
     fq_full_reduce(&ask_bn);
     bn_read_le(alpha, &alpha_bn);
@@ -175,31 +204,24 @@ int redpallas_sign(
     fq_add(&rsk, &ask_bn, &alpha_bn);
 
     // Get SpendAuth generator
-    pallas_point G_spend;
     pallas_group_hash(&G_spend, "z.cash:Orchard", (const uint8_t*)"G", 1);
 
     pallas_report(10, "Computing rk...");
 
     // rk = [rsk] * G_SpendAuth
-    pallas_point rk;
     pallas_point_mul(&rk, &rsk, &G_spend);
     pallas_point_encode(rk_out, &rk);
 
     pallas_report(40, "Computing nonce...");
 
     // Generate nonce
-    uint8_t rsk_bytes[32];
     bn_write_le(&rsk, rsk_bytes);
-    bignum256 nonce;
     generate_nonce(&nonce, rsk_bytes, sighash);
-    memzero(rsk_bytes, 32);
 
     pallas_report(50, "Computing R...");
 
     // R = [nonce] * G_SpendAuth
-    pallas_point R;
     pallas_point_mul(&R, &nonce, &G_spend);
-    uint8_t R_bytes[32];
     pallas_point_encode(R_bytes, &R);
 
     pallas_report(80, "Computing S...");
@@ -209,22 +231,17 @@ int redpallas_sign(
     memset(personal, 0, 16);
     memcpy(personal, "Zcash_RedPallasH", 16);
 
-    blake2b_state S_hash;
     blake2b_InitPersonal(&S_hash, 64, personal, 16);
     blake2b_Update(&S_hash, R_bytes, 32);
     blake2b_Update(&S_hash, rk_out, 32);
     blake2b_Update(&S_hash, sighash, 32);
 
-    uint8_t challenge_raw[64];
     blake2b_Final(&S_hash, challenge_raw, 64);
 
-    bignum256 challenge;
     fq_from_wide(&challenge, challenge_raw);
 
     // S = nonce + challenge * rsk (mod q)
-    bignum256 c_times_rsk;
     fq_mul(&c_times_rsk, &challenge, &rsk);
-    bignum256 S_scalar;
     fq_add(&S_scalar, &nonce, &c_times_rsk);
 
     // Output signature: R || S
@@ -233,7 +250,7 @@ int redpallas_sign(
 
     pallas_report(100, "Done");
 
-    // Cleanup ALL secrets and intermediates
+    // Cleanup ALL secrets and intermediates from BSS
     memzero(&ask_bn, sizeof(ask_bn));
     memzero(&alpha_bn, sizeof(alpha_bn));
     memzero(&rsk, sizeof(rsk));
@@ -243,6 +260,7 @@ int redpallas_sign(
     memzero(&c_times_rsk, sizeof(c_times_rsk));
     memzero(challenge_raw, sizeof(challenge_raw));
     memzero(R_bytes, sizeof(R_bytes));
+    memzero(rsk_bytes, sizeof(rsk_bytes));
     memzero(&S_hash, sizeof(S_hash));
     memzero(&G_spend, sizeof(G_spend));
     memzero(&rk, sizeof(rk));

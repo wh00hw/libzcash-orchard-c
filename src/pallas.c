@@ -687,9 +687,10 @@ void pallas_hash_to_curve(pallas_point* r, const char* domain, const uint8_t* ms
 
     // b_0 = BLAKE2b-64(personal=zeros, Z_pad(128) || msg || I2OSP(128,2) || I2OSP(0,1) || DST || len)
     {
-        blake2b_state S;
+        static blake2b_state S;
         blake2b_InitPersonal(&S, CHUNKLEN, personal, 16);
-        uint8_t zeros[128] = {0};
+        static uint8_t zeros[128];
+        memset(zeros, 0, 128);
         blake2b_Update(&S, zeros, 128);
         blake2b_Update(&S, msg, msg_len);
         uint8_t len_buf[3] = {0, (uint8_t)(CHUNKLEN * 2), 0}; // I2OSP(128,2) || I2OSP(0,1)
@@ -702,7 +703,7 @@ void pallas_hash_to_curve(pallas_point* r, const char* domain, const uint8_t* ms
 
     // b_1 = BLAKE2b-64(personal=zeros, b_0 || I2OSP(1,1) || DST || len)
     {
-        blake2b_state S;
+        static blake2b_state S;
         blake2b_InitPersonal(&S, CHUNKLEN, personal, 16);
         blake2b_Update(&S, b0, CHUNKLEN);
         uint8_t one = 1;
@@ -715,9 +716,9 @@ void pallas_hash_to_curve(pallas_point* r, const char* domain, const uint8_t* ms
 
     // b_2 = BLAKE2b-64(personal=zeros, (b_0 XOR b_1) || I2OSP(2,1) || DST || len)
     {
-        blake2b_state S;
+        static blake2b_state S;
         blake2b_InitPersonal(&S, CHUNKLEN, personal, 16);
-        uint8_t xored[64];
+        static uint8_t xored[64];
         for(int j = 0; j < 64; j++) xored[j] = b0[j] ^ b1[j];
         blake2b_Update(&S, xored, CHUNKLEN);
         uint8_t two = 2;
@@ -757,25 +758,26 @@ void pallas_hash_to_curve(pallas_point* r, const char* domain, const uint8_t* ms
         }
     }
 
-    // Map to iso-Pallas via SWU
-    bignum256 ix0, iy0, ix1, iy1;
-    map_to_curve_swu(&u0, &ix0, &iy0);
-    map_to_curve_swu(&u1, &ix1, &iy1);
+    // Map to iso-Pallas via SWU, apply isogeny, and add.
+    // All large intermediates are static to avoid ~700 bytes stack pressure.
+    {
+        static bignum256 ix0, iy0, ix1, iy1;
+        map_to_curve_swu(&u0, &ix0, &iy0);
+        map_to_curve_swu(&u1, &ix1, &iy1);
 
-    // Apply isogeny to get Pallas points
-    bignum256 px0, py0, px1, py1;
-    iso_map(&ix0, &iy0, &px0, &py0);
-    iso_map(&ix1, &iy1, &px1, &py1);
+        static bignum256 px0, py0, px1, py1;
+        iso_map(&ix0, &iy0, &px0, &py0);
+        iso_map(&ix1, &iy1, &px1, &py1);
 
-    // Add the two points
-    pallas_point p0, p1;
-    bn_copy(&px0, &p0.x); bn_copy(&py0, &p0.y); p0.infinity = 0;
-    bn_copy(&px1, &p1.x); bn_copy(&py1, &p1.y); p1.infinity = 0;
+        static pallas_point p0, p1;
+        bn_copy(&px0, &p0.x); bn_copy(&py0, &p0.y); p0.infinity = 0;
+        bn_copy(&px1, &p1.x); bn_copy(&py1, &p1.y); p1.infinity = 0;
 
-    pallas_jac j0, jtmp;
-    pallas_to_jac(&j0, &p0);
-    pallas_jac_add_mixed(&jtmp, &j0, &p1);
-    pallas_from_jac(r, &jtmp);
+        static pallas_jac j0, jtmp;
+        pallas_to_jac(&j0, &p0);
+        pallas_jac_add_mixed(&jtmp, &j0, &p1);
+        pallas_from_jac(r, &jtmp);
+    }
 }
 
 void pallas_group_hash(pallas_point* r, const char* domain, const uint8_t* msg, size_t msg_len) {
