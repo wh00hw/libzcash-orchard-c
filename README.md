@@ -28,6 +28,25 @@ Implements key derivation, address generation, RedPallas signing, and a binary s
 | RISC-V (GD32V, ESP32-C3) | Portable | Provide `random32()`, compile with GCC |
 | Linux / macOS (testing) | Works | Uses LCG fallback (test only, **not secure**) |
 
+## Platform security considerations
+
+This library provides **cryptographic primitives**, not a complete hardware wallet. Running it on a generic microcontroller does **not** provide hardware wallet security guarantees.
+
+| Platform | Signing isolation | Key storage | Threat model |
+|----------|-------------------|-------------|--------------|
+| Flipper Zero | Tactile confirmation (physical button + display) | Internal flash, no extraction API | Hardware wallet (with caveats) |
+| Ledger / Trezor | Secure element + display confirmation | Secure enclave | Full hardware wallet |
+| ESP32-S2 dev board | None — software only | Flash, extractable via JTAG | Development / prototyping **only** |
+| STM32 bare metal | Depends on integration | Depends on MPU / TrustZone config | Varies |
+
+A hardware wallet requires **at minimum**:
+- Physical transaction confirmation (button + display)
+- Key isolation (secure element or equivalent)
+- Debug interface lockdown (JTAG / SWD disabled in production)
+- Side-channel countermeasures beyond constant-time software
+
+> **"Runs on ESP32" ≠ "hardware wallet threat model."** An ESP32-S2 dev board has no tactile signing isolation, no secure key storage, and an open debug interface. Use it for development and interoperability testing, not for protecting real funds.
+
 ## Building
 
 ```bash

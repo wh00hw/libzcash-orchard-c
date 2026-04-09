@@ -104,20 +104,25 @@ static void pallas_point_encode(uint8_t out[32], const pallas_point* p) {
 // T = BLAKE2b-512("Zcash_RedPallasN", rsk_bytes || sighash || random)
 // nonce = T mod q
 static void generate_nonce(bignum256* nonce, const uint8_t rsk_bytes[32], const uint8_t sighash[32]) {
-    uint8_t random_bytes[32];
+    static uint8_t random_bytes[32];
+#ifdef TEST_DETERMINISTIC_NONCE
+    // For KAT testing: use fixed random bytes so signatures are reproducible.
+    memset(random_bytes, 0x42, 32);
+#else
     random_buffer(random_bytes, 32);
+#endif
 
-    uint8_t personal[16];
+    static uint8_t personal[16];
     memset(personal, 0, 16);
     memcpy(personal, "Zcash_RedPallasN", 16);
 
-    blake2b_state S;
+    static blake2b_state S;
     blake2b_InitPersonal(&S, 64, personal, 16);
     blake2b_Update(&S, rsk_bytes, 32);
     blake2b_Update(&S, sighash, 32);
     blake2b_Update(&S, random_bytes, 32);
 
-    uint8_t hash[64];
+    static uint8_t hash[64];
     blake2b_Final(&S, hash, 64);
 
     // Wide reduction: all 64 bytes → scalar mod q
@@ -125,7 +130,7 @@ static void generate_nonce(bignum256* nonce, const uint8_t rsk_bytes[32], const 
 
     // Constant-time fix for zero nonce: set to 1 without branching.
     // bn_is_zero returns 1 if zero, 0 otherwise.
-    bignum256 one;
+    static bignum256 one;
     bn_one(&one);
     int is_zero = bn_is_zero(nonce);
     bn_cmov(nonce, is_zero, &one, nonce);

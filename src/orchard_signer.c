@@ -77,7 +77,7 @@ OrchardSignerError orchard_signer_verify(OrchardSignerCtx *ctx,
     uint8_t computed[32];
     zip244_shielded_sighash(&ctx->tx_meta, &ctx->actions_state, computed);
 
-    if (memcmp(computed, expected_sighash, 32) != 0) {
+    if (!ct_memequal(computed, expected_sighash, 32)) {
         memzero(computed, sizeof(computed));
         orchard_signer_reset(ctx);
         return SIGNER_ERR_SIGHASH_MISMATCH;
@@ -98,7 +98,7 @@ OrchardSignerError orchard_signer_check(const OrchardSignerCtx *ctx,
         return SIGNER_ERR_NOT_VERIFIED;
     }
 
-    if (memcmp(sighash, ctx->verified_sighash, 32) != 0) {
+    if (!ct_memequal(sighash, ctx->verified_sighash, 32)) {
         return SIGNER_ERR_WRONG_SIGHASH;
     }
 
@@ -117,7 +117,7 @@ OrchardSignerError orchard_signer_sign(const OrchardSignerCtx *ctx,
         return SIGNER_ERR_NOT_VERIFIED;
     }
 
-    if (memcmp(sighash, ctx->verified_sighash, 32) != 0) {
+    if (!ct_memequal(sighash, ctx->verified_sighash, 32)) {
         return SIGNER_ERR_WRONG_SIGHASH;
     }
 

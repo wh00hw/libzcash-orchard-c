@@ -1,0 +1,18 @@
+[package]
+name = "gen_test_vectors"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+orchard = "0.10"
+pasta_curves = "0.5"
+group = "0.13"
+ff = "0.13"
+blake2b_simd = "1"
+hex = "0.4"
+reddsa = "0.5"
+rand = "0.8"
+fpe = "0.6"
+aes = "0.8"
+f4jumble = "0.1"
+zcash_spec = "0.1"

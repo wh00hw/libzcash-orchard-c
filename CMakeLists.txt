@@ -76,6 +76,14 @@ install(EXPORT zcash-orchard-c-targets
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/zcash-orchard-c
 )
 
+# --- Stack analysis (optional, GCC only) ---
+
+option(STACK_ANALYSIS "Enable -fstack-usage for stack bound analysis" OFF)
+
+if(STACK_ANALYSIS)
+    target_compile_options(zcash-orchard-c PRIVATE -fstack-usage)
+endif()
+
 # --- Tests (optional) ---
 
 option(BUILD_TESTS "Build tests" ON)

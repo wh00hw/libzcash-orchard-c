@@ -382,6 +382,40 @@ void f4jumble(uint8_t* data, size_t len) {
     // Result: c || d = a || b (in-place)
 }
 
+void f4jumble_inv(uint8_t* data, size_t len) {
+    if(len < 48 || len > F4JUMBLE_MAX_INPUT) return;
+    size_t l_L = len / 2;
+    if(l_L > 64) l_L = 64;
+    size_t l_R = len - l_L;
+
+    static uint8_t buf[F4JUMBLE_MAX_INPUT - 64];
+
+    uint8_t* c = data;
+    uint8_t* d = data + l_L;
+
+    // y = c XOR H(1, d)
+    f4jumble_H(1, d, l_R, buf, l_L);
+    for(size_t i = 0; i < l_L; i++) c[i] ^= buf[i];
+    // Now c = y
+
+    // x = d XOR G(1, y)
+    f4jumble_G(1, c, l_L, buf, l_R);
+    for(size_t i = 0; i < l_R; i++) d[i] ^= buf[i];
+    // Now d = x
+
+    // a = y XOR H(0, x)
+    f4jumble_H(0, d, l_R, buf, l_L);
+    for(size_t i = 0; i < l_L; i++) c[i] ^= buf[i];
+    // Now c = a
+
+    // b = x XOR G(0, a)
+    f4jumble_G(0, c, l_L, buf, l_R);
+    for(size_t i = 0; i < l_R; i++) d[i] ^= buf[i];
+    // Now d = b
+
+    // Result: a || b = c || d (in-place)
+}
+
 // ============================================================
 // Unified Address encoding
 // ============================================================
@@ -421,18 +455,18 @@ int orchard_derive_unified_address(
 
     pallas_init();
 
-    uint8_t d[11];
-    uint8_t pk_d_bytes[32];
+    static uint8_t d[11];
+    static uint8_t pk_d_bytes[32];
 
     // Cache is handled by caller
 
-    // Large structures are static to avoid ~548 bytes of stack pressure
+    // Large structures are static to avoid stack pressure
     // on constrained devices (e.g. Flipper Zero: 4 KB stack).
     // All are explicitly zeroed after use to prevent secret persistence.
     {
         // 1. Derive spending key and components
         pallas_report(2, "Deriving keys...");
-        uint8_t sk[32], ask_le[32], nk_le[32], rivk_le[32];
+        static uint8_t sk[32], ask_le[32], nk_le[32], rivk_le[32];
         orchard_derive_account_sk(seed, coin_type, account, sk);
         orchard_derive_keys(sk, ask_le, nk_le, rivk_le);
 
@@ -455,7 +489,7 @@ int orchard_derive_unified_address(
 
         static uint8_t commit_msg[64];
         memzero(commit_msg, 64);
-        uint8_t nk_bytes_le[32], ak_x_bytes[32];
+        static uint8_t nk_bytes_le[32], ak_x_bytes[32];
         bn_write_le(&nk_bn, nk_bytes_le);
         nk_bytes_le[31] &= 0x7F;
         bn_write_le(&ak.x, ak_x_bytes);
@@ -477,13 +511,13 @@ int orchard_derive_unified_address(
         bn_copy(&ivk_x, &ivk);
 
         // 4. dk
-        uint8_t ak_compressed[32];
+        static uint8_t ak_compressed[32];
         bn_write_le(&ak.x, ak_compressed);
         if(ak.y.val[0] & 1) ak_compressed[31] |= 0x80;
-        uint8_t dk[32];
+        static uint8_t dk[32];
         {
-            uint8_t prf_dk_out[64];
-            blake2b_state S_dk;
+            static uint8_t prf_dk_out[64];
+            static blake2b_state S_dk;
             blake2b_InitPersonal(&S_dk, 64, "Zcash_ExpandSeed", 16);
             blake2b_Update(&S_dk, rivk_le, 32);
             uint8_t dk_d[1] = {0x82};
@@ -498,7 +532,8 @@ int orchard_derive_unified_address(
 
         // 5. diversifier
         pallas_report(70, "Diversifier...");
-        uint8_t d_in[11] = {0};
+        static uint8_t d_in[11];
+        memzero(d_in, sizeof(d_in));
         ff1_aes256_encrypt(dk, d_in, d);
 
         // 6. g_d = DiversifyHash(d)
@@ -546,7 +581,7 @@ int orchard_derive_unified_address(
 
     // 8. Build raw UA per ZIP-316: Orchard-only
     //    receivers (ascending typecode) || HRP padded to 16 bytes
-    uint8_t raw_ua[80]; // Orchard(45) + padding(16) = 61
+    static uint8_t raw_ua[80]; // Orchard(45) + padding(16) = 61
     size_t raw_len = 0;
 
     // Orchard receiver (typecode 0x03)
@@ -573,7 +608,7 @@ int orchard_derive_unified_address(
     f4jumble(raw_ua, raw_len);
 
     // 11. Bech32m encode (ignoring length restrictions per ZIP-316)
-    uint8_t data5[160];
+    static uint8_t data5[160];
     size_t data5_len = convert_bits_8to5(raw_ua, raw_len, data5, sizeof(data5));
 
     // Use bech32_encode directly (not segwit_addr_encode which has length limits)

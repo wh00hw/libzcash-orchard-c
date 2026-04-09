@@ -180,10 +180,12 @@ void pbkdf2_hmac_sha512(
         last_block_size = SHA512_DIGEST_LENGTH;
     }
     for(uint32_t blocknr = 1; blocknr <= blocks_count; blocknr++) {
-        PBKDF2_HMAC_SHA512_CTX pctx = {0};
+        static PBKDF2_HMAC_SHA512_CTX pctx;
+        memzero(&pctx, sizeof(pctx));
         pbkdf2_hmac_sha512_Init(&pctx, pass, passlen, salt, saltlen, blocknr);
         pbkdf2_hmac_sha512_Update(&pctx, iterations);
-        uint8_t digest[SHA512_DIGEST_LENGTH] = {0};
+        static uint8_t digest[SHA512_DIGEST_LENGTH];
+        memzero(digest, sizeof(digest));
         pbkdf2_hmac_sha512_Final(&pctx, digest);
         uint32_t key_offset = (blocknr - 1) * SHA512_DIGEST_LENGTH;
         if(blocknr < blocks_count) {

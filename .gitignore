@@ -9,3 +9,6 @@ compile_commands.json
 .vscode/
 .idea/
 .claude/
+
+# Rust build artifacts (test vector generator)
+tools/gen_test_vectors/target/

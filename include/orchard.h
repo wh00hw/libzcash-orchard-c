@@ -54,8 +54,9 @@ int orchard_derive_unified_address(
     uint8_t* d_out,
     uint8_t* pk_d_out);
 
-// F4Jumble encoding (ZIP-316)
+// F4Jumble encoding / decoding (ZIP-316)
 void f4jumble(uint8_t* data, size_t len);
+void f4jumble_inv(uint8_t* data, size_t len);
 
 // FF1-AES-256 encrypt 11 bytes (for diversifier derivation)
 void ff1_aes256_encrypt(const uint8_t key[32], const uint8_t in[11], uint8_t out[11]);
