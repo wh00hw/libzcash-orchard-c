@@ -81,6 +81,13 @@ bool zip244_parse_tx_meta(const uint8_t* data, size_t len, Zip244TxMeta* out) {
     memcpy(out->anchor, data + 29, 32);
     memcpy(out->transparent_sig_digest, data + 61, 32);
     memcpy(out->sapling_digest, data + 93, 32);
+
+    /* Extended format: coin_type appended after the core 125 bytes */
+    if (len >= ZIP244_TX_META_EXT_SIZE) {
+        out->coin_type = read_u32_le(data + 125);
+    } else {
+        out->coin_type = 0; /* unspecified (backward compat with old SDK) */
+    }
     return true;
 }
 
@@ -95,7 +102,9 @@ size_t zip244_encode_tx_meta(uint8_t* buf, const Zip244TxMeta* meta) {
     memcpy(buf + 29, meta->anchor, 32);
     memcpy(buf + 61, meta->transparent_sig_digest, 32);
     memcpy(buf + 93, meta->sapling_digest, 32);
-    return ZIP244_TX_META_SIZE;
+    /* Extended: coin_type (not part of ZIP-244 sighash, used for network validation) */
+    write_u32_le(buf + 125, meta->coin_type);
+    return ZIP244_TX_META_EXT_SIZE;
 }
 
 /* ------------------------------------------------------------------ */

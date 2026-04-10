@@ -24,13 +24,14 @@ typedef enum {
 
 typedef enum {
     SIGNER_OK = 0,
-    SIGNER_ERR_BAD_META,        /* Invalid metadata payload */
-    SIGNER_ERR_BAD_ACTION,      /* Invalid action data */
-    SIGNER_ERR_BAD_STATE,       /* Unexpected call for current state */
-    SIGNER_ERR_SIGHASH_MISMATCH,/* Device-computed sighash != companion sighash */
-    SIGNER_ERR_NOT_VERIFIED,    /* sign() called without verification */
-    SIGNER_ERR_WRONG_SIGHASH,   /* SIGN_REQ sighash doesn't match verified one */
-    SIGNER_ERR_SIGN_FAILED,     /* redpallas_sign returned error */
+    SIGNER_ERR_BAD_META,          /* Invalid metadata payload */
+    SIGNER_ERR_BAD_ACTION,        /* Invalid action data */
+    SIGNER_ERR_BAD_STATE,         /* Unexpected call for current state */
+    SIGNER_ERR_SIGHASH_MISMATCH,  /* Device-computed sighash != companion sighash */
+    SIGNER_ERR_NOT_VERIFIED,      /* sign() called without verification */
+    SIGNER_ERR_WRONG_SIGHASH,     /* SIGN_REQ sighash doesn't match verified one */
+    SIGNER_ERR_SIGN_FAILED,       /* redpallas_sign returned error */
+    SIGNER_ERR_NETWORK_MISMATCH,  /* TxMeta coin_type != session coin_type */
 } OrchardSignerError;
 
 typedef struct {
@@ -41,6 +42,8 @@ typedef struct {
     uint16_t actions_received;
     bool has_meta;
     uint8_t verified_sighash[32];
+    /** Session coin_type set by FvkReq. 0 = unset (backward compat). */
+    uint32_t coin_type;
 } OrchardSignerCtx;
 
 /**

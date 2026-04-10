@@ -59,6 +59,11 @@ typedef enum {
     HWP_ERR_INVALID_STATE     = 0x0A, // Unexpected message in current state (v2)
 } HwpErrorCode;
 
+// FVK_REQ payload (v2.1+):
+//   coin_type[4 LE]   (133 = mainnet, 1 = testnet)
+// Empty payload accepted for backward compatibility (device uses default).
+#define HWP_FVK_REQ_SIZE 4
+
 // SIGN_REQ payload:
 //   sighash[32] || alpha[32] || amount[8 LE] || fee[8 LE] || recipient_len[1] || recipient[N]
 // Total: 81 + recipient_len

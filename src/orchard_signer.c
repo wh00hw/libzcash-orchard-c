@@ -30,6 +30,13 @@ OrchardSignerError orchard_signer_feed_meta(OrchardSignerCtx *ctx,
         return SIGNER_ERR_BAD_META;
     }
 
+    /* Validate coin_type consistency: if both session and TxMeta specify
+     * a coin_type (non-zero), they must match. */
+    if (ctx->coin_type != 0 && ctx->tx_meta.coin_type != 0 &&
+        ctx->coin_type != ctx->tx_meta.coin_type) {
+        return SIGNER_ERR_NETWORK_MISMATCH;
+    }
+
     zip244_actions_init(&ctx->actions_state);
     ctx->has_meta = true;
     ctx->actions_expected = total_actions;

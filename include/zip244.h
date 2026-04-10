@@ -32,7 +32,10 @@
  * companion from the full transaction data, since the device only has
  * access to the Orchard bundle.
  */
-#define ZIP244_TX_META_SIZE 125
+/** Wire size of the core TxMeta fields (used for ZIP-244 sighash computation). */
+#define ZIP244_TX_META_SIZE     125
+/** Wire size with the coin_type extension (network discrimination). */
+#define ZIP244_TX_META_EXT_SIZE 129
 
 typedef struct {
     uint32_t version;
@@ -45,6 +48,8 @@ typedef struct {
     uint8_t  anchor[32];
     uint8_t  transparent_sig_digest[32];
     uint8_t  sapling_digest[32];
+    /** ZIP-32 coin type: 133 = mainnet, 1 = testnet, 0 = unspecified. */
+    uint32_t coin_type;
 } Zip244TxMeta;
 
 /**
