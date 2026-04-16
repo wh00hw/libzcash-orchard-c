@@ -12,6 +12,8 @@ add_library(zcash-orchard-c-deterministic STATIC
     ${CMAKE_SOURCE_DIR}/src/orchard.c
     ${CMAKE_SOURCE_DIR}/src/pallas.c
     ${CMAKE_SOURCE_DIR}/src/redpallas.c
+    ${CMAKE_SOURCE_DIR}/src/secp256k1.c
+    ${CMAKE_SOURCE_DIR}/src/bip32.c
     ${CMAKE_SOURCE_DIR}/src/bignum.c
     ${CMAKE_SOURCE_DIR}/src/blake2b.c
     ${CMAKE_SOURCE_DIR}/src/bip39.c

@@ -89,6 +89,8 @@ typedef struct {
     blake2b_state prevouts_ctx;    /* "ZTxIdPrevoutHash" */
     blake2b_state sequence_ctx;    /* "ZTxIdSequencHash" */
     blake2b_state outputs_ctx;     /* "ZTxIdOutputsHash" */
+    blake2b_state amounts_ctx;     /* "ZTxTrAmountsHash" (per-input sighash) */
+    blake2b_state scripts_ctx;     /* "ZTxTrScriptsHash" (per-input sighash) */
     uint16_t inputs_received;
     uint16_t outputs_received;
     bool initialized;
@@ -136,6 +138,33 @@ bool zip244_hash_transparent_output(Zip244TransparentState *state,
  */
 void zip244_transparent_digest(Zip244TransparentState *state,
                                uint8_t digest_out[32]);
+
+/**
+ * Compute the per-input transparent signature digest (ZIP-244 S.2).
+ *
+ * For SIGHASH_ALL (the standard case):
+ *   BLAKE2b-256("ZTxIdTranspaHash",
+ *       hash_type[1] || prevouts_digest || amounts_digest || scripts_digest ||
+ *       sequence_digest || outputs_digest || txin_sig_digest)
+ *
+ * Where txin_sig_digest = BLAKE2b-256("Zcash___TxInHash",
+ *       prevout_hash[32] || prevout_index[4 LE] || value[8 LE signed] ||
+ *       CompactSize(script_len) || script_pubkey || sequence[4 LE])
+ *
+ * @param state         Transparent state (must have all inputs/outputs hashed)
+ * @param input_index   Index of the input being signed
+ * @param inputs        Array of all transparent inputs (for txin_sig_digest)
+ * @param num_inputs    Number of inputs
+ * @param hash_type     Sighash type (usually 0x01 = SIGHASH_ALL)
+ * @param sighash_out   32-byte output
+ */
+void zip244_transparent_per_input_sighash(
+    Zip244TransparentState *state,
+    uint16_t input_index,
+    const uint8_t *input_data,  /* raw wire data of the specific input being signed */
+    size_t input_data_len,
+    uint8_t hash_type,
+    uint8_t sighash_out[32]);
 
 /* ------------------------------------------------------------------ */
 

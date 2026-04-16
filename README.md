@@ -2,18 +2,21 @@
 
 > **WARNING — Proof of Concept.** This library has **not** been audited. It is published for review and experimentation only. **Do not use it to protect real funds** until an independent security audit has been completed. Use at your own risk.
 
-Pure C11 library for Zcash Orchard shielded transactions on embedded hardware wallets.
+Pure C11 library for Zcash Orchard + Transparent transactions on embedded hardware wallets.
 
-Implements key derivation, address generation, RedPallas signing, and a binary serial protocol (HWP) for host-device communication. Zero external dependencies — all cryptographic primitives are self-contained. No dynamic memory allocation, no OS calls, no hardware-specific code in the core.
+Implements key derivation, address generation, RedPallas signing, ECDSA transparent signing, and a binary serial protocol (HWP) for host-device communication. Zero external dependencies — all cryptographic primitives are self-contained. No dynamic memory allocation, no OS calls, no hardware-specific code in the core.
 
 ## Features
 
 - **ZIP-32 key derivation** — master key from BIP39 seed, hardened child derivation (`m_Orchard / 32' / coin_type' / account'`)
+- **BIP-32 transparent key derivation** — `m / 44' / coin_type' / 0' / 0 / 0` for secp256k1 transparent spending keys
 - **Orchard Unified Addresses** — full derivation with F4Jumble (ZIP-316) and Bech32m encoding
 - **Pallas / RedPallas** — curve arithmetic, Sinsemilla hash, spend authorization signing
-- **ZIP-244 sighash verification** — on-device computation of the full v5 shielded sighash (header, orchard actions digest with compact/memos/noncompact sub-hashes)
+- **secp256k1 / ECDSA** — curve arithmetic (constant-time Montgomery ladder), ECDSA signing with RFC 6979 deterministic nonce, DER encoding. No precomputed tables. ~600 bytes stack peak.
+- **ZIP-244 sighash verification** — on-device computation of the full v5 shielded sighash (header, orchard actions digest with compact/memos/noncompact sub-hashes) AND transparent per-input sighash (prevouts, amounts, scripts, sequences, outputs, txin_sig digests)
+- **Transparent digest verification** — device independently computes the transparent txid digest from raw inputs/outputs, preventing a compromised companion from forging the transparent digest
 - **Signing context** (`orchard_signer.h`) — library-level invariant that refuses to sign unless ZIP-244 verification has passed; firmware cannot bypass this
-- **Hardware Wallet Protocol v2** — framed binary serial protocol with CRC-16, incremental sighash verification, compatible with [zcash-hw-wallet-sdk](https://github.com/wh00hw/zcash-hw-wallet-sdk) (Rust)
+- **Hardware Wallet Protocol v2/v3** — framed binary serial protocol with CRC-16, incremental sighash verification, transparent digest verification, transparent ECDSA signing, compatible with [zcash-hw-wallet-sdk](https://github.com/wh00hw/zcash-hw-wallet-sdk) (Rust)
 - **BIP39 mnemonic** — generation and seed derivation (PBKDF2-HMAC-SHA512)
 - **Crypto primitives** — BLAKE2b, SHA-256/512, HMAC, PBKDF2, AES-256 (FF1), all in pure C
 - **Platform-agnostic** — pluggable RNG, optional Sinsemilla table acceleration, portable compiler abstractions
@@ -192,13 +195,32 @@ int len = orchard_derive_unified_address(
     bip39_seed, 133, 0, "u", ua, sizeof(ua), NULL, NULL);
 ```
 
-### RedPallas signing
+### RedPallas signing (Orchard)
 
 ```c
 #include "redpallas.h"
 
 uint8_t sig[64], rk[32];
 redpallas_sign_spend(ask, alpha, sighash, sig, rk);
+```
+
+### ECDSA signing (Transparent)
+
+```c
+#include "secp256k1.h"
+#include "bip32.h"
+
+// Derive transparent spending key from BIP-39 seed
+uint8_t sk[32], pubkey[33];
+bip32_derive_transparent_sk(seed, 133 /* mainnet */, sk, pubkey);
+
+// Sign a 32-byte digest (e.g., per-input transparent sighash)
+uint8_t compact_sig[64];
+secp256k1_ecdsa_sign_digest(sk, digest, compact_sig);
+
+// DER encode for on-chain use
+uint8_t der[72];
+size_t der_len = secp256k1_sig_to_der(compact_sig, der);
 ```
 
 ### Hardware Wallet Protocol
@@ -226,10 +248,12 @@ include/
   platform.h       — Compiler/platform abstraction (CLZ, packing, alignment)
   options.h        — Build-time feature flags
   orchard.h        — Key derivation, address generation, F4Jumble
-  redpallas.h      — RedPallas spend authorization signing
+  redpallas.h      — RedPallas spend authorization signing (Orchard)
+  secp256k1.h      — secp256k1 curve + ECDSA signing + RFC 6979 (Transparent)
+  bip32.h          — BIP-32 transparent HD key derivation (HMAC-SHA512)
   pallas.h         — Pallas curve arithmetic, Sinsemilla hash
-  hwp.h            — Hardware Wallet Protocol v2 (serial framing)
-  zip244.h         — ZIP-244 v5 shielded sighash computation
+  hwp.h            — Hardware Wallet Protocol v2/v3 (serial framing)
+  zip244.h         — ZIP-244 v5 sighash (shielded + transparent per-input)
   orchard_signer.h — Signing context with mandatory sighash verification
   bip39.h          — BIP39 mnemonic generation
   bignum.h         — 256-bit big number arithmetic
@@ -266,7 +290,9 @@ The verification flow works incrementally:
 
 ### Trust model for non-Orchard digests
 
-The device only has access to the Orchard bundle. The transparent signature digest and sapling digest are **pre-computed by the companion** and included in the `TxMeta` wire format. This is the standard approach for Zcash hardware wallets (same as Ledger). The trust model is sound: if the companion falsifies these digests, the resulting sighash won't match the real transaction, and the on-chain signature verification will fail. There is no benefit for a malicious companion to lie about these values.
+**Transparent digest** — the companion sends raw transparent inputs and outputs to the device via `TxTransparentInput` / `TxTransparentOutput` messages (HWP v3). The device independently computes the transparent txid digest from these and verifies it matches the `transparent_sig_digest` in TxMeta. For transparent signing, the device also computes the per-input sighash on-device (including `amounts_digest`, `scripts_digest`, and `txin_sig_digest`), signs with ECDSA secp256k1, and returns a DER-encoded signature. A compromised companion **cannot** forge the transparent digest or per-input sighash.
+
+**Sapling digest** — currently pre-computed by the companion and included in `TxMeta`. This is the standard approach for Zcash hardware wallets. The trust model is sound: if the companion falsifies the sapling digest, the resulting sighash won't match the real transaction, and on-chain verification will fail.
 
 ```c
 #include "orchard_signer.h"
@@ -297,7 +323,7 @@ orchard_signer_sign(&ctx, sighash, ask, alpha, sig, rk);  // SIGNER_ERR_NOT_VERI
 
 ## Security hardening
 
-- **Constant-time scalar multiplication** — Montgomery ladder in `pallas_point_mul()` with XOR-masked conditional swap; no branching on secret scalar bits
+- **Constant-time scalar multiplication** — Montgomery ladder in `pallas_point_mul()` and `secp256k1_point_mul()` with XOR-masked conditional swap; no branching on secret scalar bits
 - **Constant-time modular reduction** — `fq_full_reduce()` uses fixed-iteration conditional subtraction via `bn_cmov()`; no variable-length while loops
 - **Constant-time field multiplication** — `fq_mul()` uses `bn_cmov()` for conditional add; no branching on secret bits
 - **Constant-time nonce handling** — nonce == 0 check uses `bn_cmov()` instead of `if` branch

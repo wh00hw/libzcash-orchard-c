@@ -19,6 +19,8 @@ set(CRYPTO_SOURCES
     src/orchard.c
     src/pallas.c
     src/redpallas.c
+    src/secp256k1.c
+    src/bip32.c
     src/bignum.c
     src/blake2b.c
     src/bip39.c

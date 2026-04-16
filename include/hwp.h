@@ -44,6 +44,8 @@ typedef enum {
     HWP_MSG_ABORT        = 0x0A, // Cancel signing session
     HWP_MSG_TX_TRANSPARENT_INPUT  = 0x0B, // Transparent input for digest verification (v3)
     HWP_MSG_TX_TRANSPARENT_OUTPUT = 0x0C, // Transparent output for digest verification (v3)
+    HWP_MSG_TRANSPARENT_SIGN_REQ  = 0x0D, // Sign transparent input (ECDSA secp256k1, v3)
+    HWP_MSG_TRANSPARENT_SIGN_RSP  = 0x0E, // Transparent signature response (v3)
 } HwpMsgType;
 
 // --- Error codes (matches zcash-hw-signer-sdk ErrorCode) ---
@@ -157,6 +159,15 @@ uint16_t hwp_encode_sign_req(uint8_t* payload, const HwpSignReq* req);
 // Parse a TX_OUTPUT payload. Returns true on success.
 // Note: output_data points into the payload buffer (not copied).
 bool hwp_parse_tx_output(const uint8_t* payload, uint16_t len, HwpTxOutput* out);
+
+// TRANSPARENT_SIGN_REQ payload (v3):
+//   input_index[2 LE] || total_inputs[2 LE] ||
+//   input_data[N] (same wire format as TxTransparentInput data)
+// The device computes the per-input sighash on-device and signs with ECDSA.
+//
+// TRANSPARENT_SIGN_RSP payload (v3):
+//   der_sig_len[1] || der_sig[N] || sighash_type[1] || pubkey[33]
+#define HWP_TRANSPARENT_SIGN_RSP_MAX (1 + 72 + 1 + 33) // 107
 
 // Encode a TX_OUTPUT payload. Returns payload size.
 uint16_t hwp_encode_tx_output(uint8_t* payload, uint16_t output_index, uint16_t total_outputs,
