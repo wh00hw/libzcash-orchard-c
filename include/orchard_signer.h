@@ -17,9 +17,10 @@
 #include "zip244.h"
 
 typedef enum {
-    SIGNER_IDLE,                /* Waiting for metadata */
-    SIGNER_RECEIVING_ACTIONS,   /* Metadata received, collecting actions */
-    SIGNER_VERIFIED,            /* ZIP-244 sighash verified, signing allowed */
+    SIGNER_IDLE,                     /* Waiting for metadata */
+    SIGNER_RECEIVING_TRANSPARENT,    /* Collecting transparent inputs/outputs (v3) */
+    SIGNER_RECEIVING_ACTIONS,        /* Metadata received, collecting actions */
+    SIGNER_VERIFIED,                 /* ZIP-244 sighash verified, signing allowed */
 } OrchardSignerState;
 
 typedef enum {
@@ -31,16 +32,23 @@ typedef enum {
     SIGNER_ERR_NOT_VERIFIED,      /* sign() called without verification */
     SIGNER_ERR_WRONG_SIGHASH,     /* SIGN_REQ sighash doesn't match verified one */
     SIGNER_ERR_SIGN_FAILED,       /* redpallas_sign returned error */
-    SIGNER_ERR_NETWORK_MISMATCH,  /* TxMeta coin_type != session coin_type */
+    SIGNER_ERR_NETWORK_MISMATCH,         /* TxMeta coin_type != session coin_type */
+    SIGNER_ERR_TRANSPARENT_BAD_INPUT,    /* Invalid transparent input data */
+    SIGNER_ERR_TRANSPARENT_BAD_OUTPUT,   /* Invalid transparent output data */
+    SIGNER_ERR_TRANSPARENT_MISMATCH,     /* Transparent digest mismatch (v3) */
 } OrchardSignerError;
 
 typedef struct {
     OrchardSignerState state;
     Zip244TxMeta tx_meta;
     Zip244ActionsState actions_state;
+    Zip244TransparentState transparent_state;   /* v3: transparent digest */
     uint16_t actions_expected;
     uint16_t actions_received;
+    uint16_t transparent_inputs_expected;
+    uint16_t transparent_outputs_expected;
     bool has_meta;
+    bool transparent_verified;                  /* v3: transparent digest matched */
     uint8_t verified_sighash[32];
     /** Session coin_type set by FvkReq. 0 = unset (backward compat). */
     uint32_t coin_type;
@@ -77,6 +85,41 @@ OrchardSignerError orchard_signer_feed_meta(OrchardSignerCtx *ctx,
  */
 OrchardSignerError orchard_signer_feed_action(OrchardSignerCtx *ctx,
                                                const uint8_t *action_data, size_t action_len);
+
+/**
+ * Begin transparent digest verification (v3).
+ * Call after feed_meta() when the transaction has transparent inputs.
+ * Transitions: RECEIVING_ACTIONS → RECEIVING_TRANSPARENT.
+ *
+ * @param num_inputs   Expected number of transparent inputs
+ * @param num_outputs  Expected number of transparent outputs
+ */
+OrchardSignerError orchard_signer_begin_transparent(OrchardSignerCtx *ctx,
+                                                     uint16_t num_inputs,
+                                                     uint16_t num_outputs);
+
+/**
+ * Feed one transparent input's data (v3).
+ * Must be in RECEIVING_TRANSPARENT state.
+ */
+OrchardSignerError orchard_signer_feed_transparent_input(OrchardSignerCtx *ctx,
+                                                          const uint8_t *data, size_t data_len);
+
+/**
+ * Feed one transparent output's data (v3).
+ * Must be in RECEIVING_TRANSPARENT state.
+ */
+OrchardSignerError orchard_signer_feed_transparent_output(OrchardSignerCtx *ctx,
+                                                           const uint8_t *data, size_t data_len);
+
+/**
+ * Verify the transparent digest against TxMeta's transparent_sig_digest (v3).
+ * Transitions: RECEIVING_TRANSPARENT → RECEIVING_ACTIONS (on match).
+ *
+ * @param expected_digest  32-byte expected transparent digest from companion
+ */
+OrchardSignerError orchard_signer_verify_transparent(OrchardSignerCtx *ctx,
+                                                      const uint8_t expected_digest[32]);
 
 /**
  * Feed the expected sighash (sentinel message) and verify.

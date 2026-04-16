@@ -69,6 +69,76 @@ typedef struct {
     bool initialized;
 } Zip244ActionsState;
 
+/* ------------------------------------------------------------------ */
+/*  Transparent digest (incremental, for on-device verification)      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Incremental state for computing the ZIP-244 transparent txid digest.
+ *
+ * Three parallel BLAKE2b contexts hash different portions of each input/output:
+ * - prevouts:  prevout_hash[32] || prevout_index[4 LE] per input
+ * - sequences: sequence[4 LE] per input
+ * - outputs:   value[8 LE] || CompactSize(script_len) || script_pubkey per output
+ *
+ * The combined digest is:
+ *   BLAKE2b-256("ZTxIdTranspaHash",
+ *       prevouts_digest || sequence_digest || outputs_digest)
+ */
+typedef struct {
+    blake2b_state prevouts_ctx;    /* "ZTxIdPrevoutHash" */
+    blake2b_state sequence_ctx;    /* "ZTxIdSequencHash" */
+    blake2b_state outputs_ctx;     /* "ZTxIdOutputsHash" */
+    uint16_t inputs_received;
+    uint16_t outputs_received;
+    bool initialized;
+} Zip244TransparentState;
+
+/**
+ * Initialize the incremental transparent digest state.
+ * Must be called before any zip244_hash_transparent_input/output() calls.
+ */
+void zip244_transparent_init(Zip244TransparentState *state);
+
+/**
+ * Hash one transparent input incrementally.
+ *
+ * Wire format (from companion SDK):
+ *   prevout_hash[32] || prevout_index[4 LE] || sequence[4 LE] ||
+ *   value[8 LE] || script_pubkey_len[2 LE] || script_pubkey[N]
+ *
+ * Extracts prevout + sequence and feeds them into the respective hashers.
+ * Returns true on success, false if data_len < 48 (minimum: 32+4+4+8).
+ */
+bool zip244_hash_transparent_input(Zip244TransparentState *state,
+                                   const uint8_t *data, size_t data_len);
+
+/**
+ * Hash one transparent output incrementally.
+ *
+ * Wire format (from companion SDK):
+ *   value[8 LE] || script_pubkey_len[2 LE] || script_pubkey[N]
+ *
+ * Re-encodes with CompactSize for the script length before hashing,
+ * matching the serialization used by zcash_primitives::TxOut::write().
+ * Returns true on success, false if data_len < 10.
+ */
+bool zip244_hash_transparent_output(Zip244TransparentState *state,
+                                    const uint8_t *data, size_t data_len);
+
+/**
+ * Finalize and compute the transparent txid digest.
+ *
+ * transparent_digest = BLAKE2b-256("ZTxIdTranspaHash",
+ *     prevouts_digest || sequence_digest || outputs_digest)
+ *
+ * digest_out must be 32 bytes.
+ */
+void zip244_transparent_digest(Zip244TransparentState *state,
+                               uint8_t digest_out[32]);
+
+/* ------------------------------------------------------------------ */
+
 /**
  * Parse transaction metadata from wire format.
  * Returns true on success.

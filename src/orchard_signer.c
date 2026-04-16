@@ -46,6 +46,110 @@ OrchardSignerError orchard_signer_feed_meta(OrchardSignerCtx *ctx,
     return SIGNER_OK;
 }
 
+/* ------------------------------------------------------------------ */
+/*  Transparent digest verification (v3)                              */
+/* ------------------------------------------------------------------ */
+
+OrchardSignerError orchard_signer_begin_transparent(OrchardSignerCtx *ctx,
+                                                     uint16_t num_inputs,
+                                                     uint16_t num_outputs)
+{
+    /* Can begin transparent verification after metadata is received
+     * but before (or instead of) starting actions. Accept from
+     * RECEIVING_ACTIONS state (after feed_meta). */
+    if (ctx->state != SIGNER_RECEIVING_ACTIONS) {
+        return SIGNER_ERR_BAD_STATE;
+    }
+
+    zip244_transparent_init(&ctx->transparent_state);
+    ctx->transparent_inputs_expected = num_inputs;
+    ctx->transparent_outputs_expected = num_outputs;
+    ctx->transparent_verified = false;
+    ctx->state = SIGNER_RECEIVING_TRANSPARENT;
+
+    return SIGNER_OK;
+}
+
+OrchardSignerError orchard_signer_feed_transparent_input(OrchardSignerCtx *ctx,
+                                                          const uint8_t *data, size_t data_len)
+{
+    if (ctx->state != SIGNER_RECEIVING_TRANSPARENT) {
+        return SIGNER_ERR_BAD_STATE;
+    }
+
+    if (ctx->transparent_state.inputs_received >= ctx->transparent_inputs_expected) {
+        return SIGNER_ERR_BAD_STATE;
+    }
+
+    if (!zip244_hash_transparent_input(&ctx->transparent_state, data, data_len)) {
+        return SIGNER_ERR_TRANSPARENT_BAD_INPUT;
+    }
+
+    return SIGNER_OK;
+}
+
+OrchardSignerError orchard_signer_feed_transparent_output(OrchardSignerCtx *ctx,
+                                                           const uint8_t *data, size_t data_len)
+{
+    if (ctx->state != SIGNER_RECEIVING_TRANSPARENT) {
+        return SIGNER_ERR_BAD_STATE;
+    }
+
+    if (ctx->transparent_state.outputs_received >= ctx->transparent_outputs_expected) {
+        return SIGNER_ERR_BAD_STATE;
+    }
+
+    if (!zip244_hash_transparent_output(&ctx->transparent_state, data, data_len)) {
+        return SIGNER_ERR_TRANSPARENT_BAD_OUTPUT;
+    }
+
+    return SIGNER_OK;
+}
+
+OrchardSignerError orchard_signer_verify_transparent(OrchardSignerCtx *ctx,
+                                                      const uint8_t expected_digest[32])
+{
+    if (ctx->state != SIGNER_RECEIVING_TRANSPARENT) {
+        return SIGNER_ERR_BAD_STATE;
+    }
+
+    if (ctx->transparent_state.inputs_received != ctx->transparent_inputs_expected) {
+        return SIGNER_ERR_BAD_STATE;
+    }
+
+    if (ctx->transparent_state.outputs_received != ctx->transparent_outputs_expected) {
+        return SIGNER_ERR_BAD_STATE;
+    }
+
+    /* Compute transparent digest from received inputs/outputs */
+    uint8_t computed[32];
+    zip244_transparent_digest(&ctx->transparent_state, computed);
+
+    /* Verify against TxMeta's transparent_sig_digest */
+    if (!ct_memequal(computed, ctx->tx_meta.transparent_sig_digest, 32)) {
+        memzero(computed, sizeof(computed));
+        orchard_signer_reset(ctx);
+        return SIGNER_ERR_TRANSPARENT_MISMATCH;
+    }
+
+    /* Also verify against the expected_digest from the companion */
+    if (!ct_memequal(computed, expected_digest, 32)) {
+        memzero(computed, sizeof(computed));
+        orchard_signer_reset(ctx);
+        return SIGNER_ERR_TRANSPARENT_MISMATCH;
+    }
+
+    memzero(computed, sizeof(computed));
+    ctx->transparent_verified = true;
+    ctx->state = SIGNER_RECEIVING_ACTIONS;
+
+    return SIGNER_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Orchard action feed                                               */
+/* ------------------------------------------------------------------ */
+
 OrchardSignerError orchard_signer_feed_action(OrchardSignerCtx *ctx,
                                                const uint8_t *action_data, size_t action_len)
 {

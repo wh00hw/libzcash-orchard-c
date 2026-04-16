@@ -11,7 +11,12 @@
 /* --- ZIP-244 BLAKE2b personalizations (all exactly 16 bytes) --- */
 
 static const char PERSONAL_HEADERS[]    = "ZTxIdHeadersHash";
-/* transparent and sapling digests are pre-computed by the companion */
+/* Transparent txid digest personalizations */
+static const char PERSONAL_TRANSPARENT[] = "ZTxIdTranspaHash";
+static const char PERSONAL_PREVOUTS[]    = "ZTxIdPrevoutHash";
+static const char PERSONAL_SEQUENCES[]   = "ZTxIdSequencHash";
+static const char PERSONAL_OUTPUTS[]     = "ZTxIdOutputsHash";
+
 static const char PERSONAL_ORCHARD[]    = "ZTxIdOrchardHash";
 static const char PERSONAL_COMPACT[]    = "ZTxIdOrcActCHash";
 static const char PERSONAL_MEMOS[]      = "ZTxIdOrcActMHash";
@@ -33,6 +38,112 @@ static const char PERSONAL_NONCOMPACT[] = "ZTxIdOrcActNHash";
 #define ACTION_DATA_SIZE 820
 #define ENC_CIPHER_SIZE  580
 #define OUT_CIPHER_SIZE  80
+
+/* ------------------------------------------------------------------ */
+/*  CompactSize encoding (Bitcoin-style variable-length integer)       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Write a CompactSize-encoded length to buf.
+ * Returns the number of bytes written (1, 3, or 5).
+ */
+static size_t write_compact_size(uint8_t* buf, uint64_t val) {
+    if (val < 253) {
+        buf[0] = (uint8_t)val;
+        return 1;
+    } else if (val <= 0xFFFF) {
+        buf[0] = 0xFD;
+        buf[1] = val & 0xFF;
+        buf[2] = (val >> 8) & 0xFF;
+        return 3;
+    } else {
+        buf[0] = 0xFE;
+        buf[1] = val & 0xFF;
+        buf[2] = (val >> 8) & 0xFF;
+        buf[3] = (val >> 16) & 0xFF;
+        buf[4] = (val >> 24) & 0xFF;
+        return 5;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Transparent txid digest (incremental)                             */
+/* ------------------------------------------------------------------ */
+
+void zip244_transparent_init(Zip244TransparentState *state) {
+    memset(state, 0, sizeof(*state));
+    blake2b_InitPersonal(&state->prevouts_ctx,  32, PERSONAL_PREVOUTS,  16);
+    blake2b_InitPersonal(&state->sequence_ctx,  32, PERSONAL_SEQUENCES, 16);
+    blake2b_InitPersonal(&state->outputs_ctx,   32, PERSONAL_OUTPUTS,   16);
+    state->inputs_received = 0;
+    state->outputs_received = 0;
+    state->initialized = true;
+}
+
+bool zip244_hash_transparent_input(Zip244TransparentState *state,
+                                   const uint8_t *data, size_t data_len) {
+    if (!state->initialized) return false;
+
+    /* Wire format: prevout_hash[32] || prevout_index[4 LE] || sequence[4 LE] ||
+     *              value[8 LE] || script_pubkey_len[2 LE] || script_pubkey[N]
+     * Minimum size: 32 + 4 + 4 + 8 = 48 (+ optional script fields) */
+    if (data_len < 48) return false;
+
+    /* prevouts_digest: prevout_hash[32] || prevout_index[4 LE] */
+    blake2b_Update(&state->prevouts_ctx, data, 36);
+
+    /* sequence_digest: sequence[4 LE] */
+    blake2b_Update(&state->sequence_ctx, data + 36, 4);
+
+    state->inputs_received++;
+    return true;
+}
+
+bool zip244_hash_transparent_output(Zip244TransparentState *state,
+                                    const uint8_t *data, size_t data_len) {
+    if (!state->initialized) return false;
+
+    /* Wire format: value[8 LE] || script_pubkey_len[2 LE] || script_pubkey[N]
+     * Minimum size: 8 + 2 = 10 */
+    if (data_len < 10) return false;
+
+    const uint8_t *value = data;
+    uint16_t script_len = (uint16_t)data[8] | ((uint16_t)data[9] << 8);
+    const uint8_t *script = data + 10;
+
+    if (data_len < 10 + script_len) return false;
+
+    /* outputs_digest matches TxOut::write():
+     *   value[8 LE] || CompactSize(script_len) || script_pubkey */
+    blake2b_Update(&state->outputs_ctx, value, 8);
+
+    uint8_t cs_buf[5];
+    size_t cs_len = write_compact_size(cs_buf, script_len);
+    blake2b_Update(&state->outputs_ctx, cs_buf, cs_len);
+    blake2b_Update(&state->outputs_ctx, script, script_len);
+
+    state->outputs_received++;
+    return true;
+}
+
+void zip244_transparent_digest(Zip244TransparentState *state,
+                               uint8_t digest_out[32]) {
+    /* Finalize sub-digests */
+    uint8_t prevouts_digest[32], sequence_digest[32], outputs_digest[32];
+
+    blake2b_Final(&state->prevouts_ctx,  prevouts_digest,  32);
+    blake2b_Final(&state->sequence_ctx,  sequence_digest,  32);
+    blake2b_Final(&state->outputs_ctx,   outputs_digest,   32);
+
+    /* Combine: BLAKE2b-256("ZTxIdTranspaHash",
+     *     prevouts_digest || sequence_digest || outputs_digest) */
+    blake2b_state root;
+    blake2b_InitPersonal(&root, 32, PERSONAL_TRANSPARENT, 16);
+    blake2b_Update(&root, prevouts_digest, 32);
+    blake2b_Update(&root, sequence_digest, 32);
+    blake2b_Update(&root, outputs_digest,  32);
+    blake2b_Final(&root, digest_out, 32);
+}
 
 /* ------------------------------------------------------------------ */
 /*  Metadata serialization                                            */

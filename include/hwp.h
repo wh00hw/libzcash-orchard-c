@@ -42,6 +42,8 @@ typedef enum {
     HWP_MSG_TX_OUTPUT     = 0x08, // Individual tx output for incremental hashing (v2)
     HWP_MSG_TX_OUTPUT_ACK = 0x09, // Output hash acknowledged (v2)
     HWP_MSG_ABORT        = 0x0A, // Cancel signing session
+    HWP_MSG_TX_TRANSPARENT_INPUT  = 0x0B, // Transparent input for digest verification (v3)
+    HWP_MSG_TX_TRANSPARENT_OUTPUT = 0x0C, // Transparent output for digest verification (v3)
 } HwpMsgType;
 
 // --- Error codes (matches zcash-hw-signer-sdk ErrorCode) ---
@@ -57,6 +59,7 @@ typedef enum {
     HWP_ERR_UNSUPPORTED_VER   = 0x08, // Protocol version not supported
     HWP_ERR_SIGHASH_MISMATCH  = 0x09, // Device sighash != companion sighash (v2)
     HWP_ERR_INVALID_STATE     = 0x0A, // Unexpected message in current state (v2)
+    HWP_ERR_TRANSPARENT_DIGEST_MISMATCH = 0x0B, // Transparent digest mismatch (v3)
 } HwpErrorCode;
 
 // FVK_REQ payload (v2.1+):
