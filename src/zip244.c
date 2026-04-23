@@ -174,6 +174,8 @@ void zip244_transparent_per_input_sighash(
     uint8_t hash_type,
     uint8_t sighash_out[32])
 {
+    (void)input_index; /* reserved for future per-input disambiguation */
+
     /* Static storage to stay within embedded stack budget.
      * Same pattern as pallas_point_mul / pallas_jac_double. */
     static blake2b_state s_ctx;
