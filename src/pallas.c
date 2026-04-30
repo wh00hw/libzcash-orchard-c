@@ -1,6 +1,7 @@
 #include "pallas.h"
 #include "blake2b.h"
 #include "memzero.h"
+#include <stdio.h>
 #include <string.h>
 
 // Progress callback
@@ -871,15 +872,13 @@ void sinsemilla_short_commit(
 
     // S = SinsemillaHashToPoint(domain + "-M", M)
     char m_domain[128] = {0};
-    strcpy(m_domain, domain);
-    strcat(m_domain, "-M");
+    snprintf(m_domain, sizeof(m_domain), "%s-M", domain);
     static pallas_point S;
     sinsemilla_hash_to_point(&S, m_domain, msg_bits, num_bits);
 
     // R = hash_to_curve(domain + "-r")(&[])
     char r_domain[128] = {0};
-    strcpy(r_domain, domain);
-    strcat(r_domain, "-r");
+    snprintf(r_domain, sizeof(r_domain), "%s-r", domain);
     static pallas_point R;
     pallas_hash_to_curve(&R, r_domain, (const uint8_t*)"", 0);
 
