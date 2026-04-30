@@ -32,6 +32,21 @@ fn write_vector(out: &mut String, name: &str, bytes: &[u8]) {
     .unwrap();
 }
 
+// Emit a domain literal as null-terminated bytes so callers that take it
+// via `(const char*)` and call strlen()/snprintf("%s", ...) read a proper
+// C string — without the trailing NUL the C side reads past the end of
+// the array into adjacent BSS, which produces wrong hash inputs.
+fn write_domain(out: &mut String, name: &str, domain: &str) {
+    let mut bytes = domain.as_bytes().to_vec();
+    bytes.push(0);
+    writeln!(
+        out,
+        "static const uint8_t {name}[] = {{ {} }};",
+        bytes_to_c_array(&bytes)
+    )
+    .unwrap();
+}
+
 fn write_vector_with_len(out: &mut String, name: &str, bytes: &[u8]) {
     write_vector(out, name, bytes);
     writeln!(out, "static const size_t {name}_len = {};", bytes.len()).unwrap();
@@ -158,7 +173,7 @@ fn generate_hash_to_curve_vectors(out: &mut String) {
         let point = hasher(msg);
         let bytes = point_to_le_bytes(&point);
 
-        write_vector(out, &format!("{name}_domain"), domain.as_bytes());
+        write_domain(out, &format!("{name}_domain"), domain);
         writeln!(
             out,
             "static const size_t {name}_domain_len = {};",
@@ -491,7 +506,7 @@ fn generate_sinsemilla_vectors(out: &mut String) {
         let result = sinsemilla_hash_to_point(domain, &msg_bytes, 10);
         let result_bytes = point_to_le_bytes(&result);
 
-        write_vector(out, "sinse_htp_domain", domain.as_bytes());
+        write_domain(out, "sinse_htp_domain", domain);
         writeln!(out, "static const size_t sinse_htp_domain_len = {};", domain.len()).unwrap();
         write_vector(out, "sinse_htp_msg", &msg_bytes);
         writeln!(out, "static const size_t sinse_htp_num_bits = 10;").unwrap();
@@ -535,7 +550,7 @@ fn generate_sinsemilla_vectors(out: &mut String) {
         let commit = s_point + r_gen * rcm;
         let commit_bytes = point_to_le_bytes(&commit);
 
-        write_vector(out, "sinse_sc_domain", domain.as_bytes());
+        write_domain(out, "sinse_sc_domain", domain);
         writeln!(out, "static const size_t sinse_sc_domain_len = {};", domain.len()).unwrap();
         write_vector(out, "sinse_sc_msg", &msg_bytes[..64]);
         writeln!(out, "static const size_t sinse_sc_num_bits = {};", num_bits).unwrap();
