@@ -62,6 +62,8 @@ typedef enum {
     HWP_ERR_SIGHASH_MISMATCH  = 0x09, // Device sighash != companion sighash (v2)
     HWP_ERR_INVALID_STATE     = 0x0A, // Unexpected message in current state (v2)
     HWP_ERR_TRANSPARENT_DIGEST_MISMATCH = 0x0B, // Transparent digest mismatch (v3)
+    HWP_ERR_SAPLING_NOT_EMPTY           = 0x0C, // sapling_digest != empty-bundle
+                                                // constant (Orchard-only invariant)
 } HwpErrorCode;
 
 // FVK_REQ payload (v2.1+):

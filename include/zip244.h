@@ -31,6 +31,11 @@
  * The transparent_sig_digest and sapling_digest are pre-computed by the
  * companion from the full transaction data, since the device only has
  * access to the Orchard bundle.
+ *
+ * Orchard-only invariant: this signer enforces sapling_digest equal to
+ * the ZIP-244 empty-bundle constant (zip244_sapling_empty_digest) at
+ * orchard_signer_feed_meta() time. Any non-empty value aborts the
+ * session with SIGNER_ERR_SAPLING_NOT_EMPTY before action streaming.
  */
 /** Wire size of the core TxMeta fields (used for ZIP-244 sighash computation). */
 #define ZIP244_TX_META_SIZE     125
@@ -220,6 +225,22 @@ void zip244_orchard_digest(Zip244ActionsState* state,
  * personal must be exactly 16 bytes. digest_out must be 32 bytes.
  */
 void zip244_empty_digest(const char* personal, uint8_t digest_out[32]);
+
+/**
+ * Compute the empty-bundle Sapling sighash digest (ZIP-244).
+ *
+ * Equivalent to zip244_empty_digest("ZTxIdSaplingHash", out).
+ *
+ * The wallet is Orchard-only by design (no Sapling keys, no Sapling notes,
+ * no Sapling-only recipients in scope), so any well-formed transaction it
+ * signs must have an empty Sapling bundle. The signer enforces equality
+ * between the companion-supplied sapling_digest and this constant on
+ * TxMeta receipt; any non-empty Sapling component aborts the session
+ * before action streaming begins.
+ *
+ * digest_out must be 32 bytes.
+ */
+void zip244_sapling_empty_digest(uint8_t digest_out[32]);
 
 /**
  * Compute the header digest.

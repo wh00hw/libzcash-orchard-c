@@ -36,6 +36,8 @@ typedef enum {
     SIGNER_ERR_TRANSPARENT_BAD_INPUT,    /* Invalid transparent input data */
     SIGNER_ERR_TRANSPARENT_BAD_OUTPUT,   /* Invalid transparent output data */
     SIGNER_ERR_TRANSPARENT_MISMATCH,     /* Transparent digest mismatch (v3) */
+    SIGNER_ERR_SAPLING_NOT_EMPTY,        /* sapling_digest != empty-bundle constant
+                                            (Orchard-only invariant violation) */
 } OrchardSignerError;
 
 typedef struct {

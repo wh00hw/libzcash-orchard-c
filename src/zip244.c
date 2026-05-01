@@ -26,6 +26,7 @@ static const char PERSONAL_ORCHARD[]    = "ZTxIdOrchardHash";
 static const char PERSONAL_COMPACT[]    = "ZTxIdOrcActCHash";
 static const char PERSONAL_MEMOS[]      = "ZTxIdOrcActMHash";
 static const char PERSONAL_NONCOMPACT[] = "ZTxIdOrcActNHash";
+static const char PERSONAL_SAPLING[]    = "ZTxIdSaplingHash";
 /* Root sighash: first 12 bytes are "ZcashTxHash_", last 4 = branch_id LE */
 
 /* --- Action data field offsets --- */
@@ -397,6 +398,10 @@ void zip244_empty_digest(const char* personal, uint8_t digest_out[32]) {
     blake2b_state s;
     blake2b_InitPersonal(&s, 32, personal, 16);
     blake2b_Final(&s, digest_out, 32);
+}
+
+void zip244_sapling_empty_digest(uint8_t digest_out[32]) {
+    zip244_empty_digest(PERSONAL_SAPLING, digest_out);
 }
 
 void zip244_header_digest(const Zip244TxMeta* meta, uint8_t digest_out[32]) {

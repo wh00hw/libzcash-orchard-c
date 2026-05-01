@@ -37,6 +37,22 @@ OrchardSignerError orchard_signer_feed_meta(OrchardSignerCtx *ctx,
         return SIGNER_ERR_NETWORK_MISMATCH;
     }
 
+    /* Orchard-only invariant: the wallet derives no Sapling keys, holds no
+     * Sapling notes, and does not send to Sapling-only recipients. The
+     * companion-supplied sapling_digest must therefore equal the ZIP-244
+     * empty-bundle constant. Enforcing this on-device closes the last
+     * sighash component that was previously trusted from the companion
+     * and prevents a hostile companion from siphoning value via a hidden
+     * Sapling output. Aborts the session before any action is hashed. */
+    uint8_t sapling_empty[32];
+    zip244_sapling_empty_digest(sapling_empty);
+    if (!ct_memequal(ctx->tx_meta.sapling_digest, sapling_empty, 32)) {
+        memzero(sapling_empty, sizeof(sapling_empty));
+        memzero(&ctx->tx_meta, sizeof(ctx->tx_meta));
+        return SIGNER_ERR_SAPLING_NOT_EMPTY;
+    }
+    memzero(sapling_empty, sizeof(sapling_empty));
+
     zip244_actions_init(&ctx->actions_state);
     ctx->has_meta = true;
     ctx->actions_expected = total_actions;
