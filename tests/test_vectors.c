@@ -456,6 +456,37 @@ static void test_orchard_note_commit(void) {
     assert_eq_bytes("orchard_compute_cmx", note_commit_expected_cmx, cmx, 32);
 }
 
+/* ── Orchard Unified Address encoding from raw (d, pk_d) ── */
+
+static void test_orchard_encode_ua_raw(void) {
+    printf("\nOrchard UA encoding from raw (d, pk_d) — vs librustzcash + ZIP-316:\n");
+
+    const uint8_t* d    = note_commit_recipient;
+    const uint8_t* pk_d = note_commit_recipient + 11;
+
+    char ua[256] = {0};
+    int n = orchard_encode_ua_raw(d, pk_d, "u", ua, sizeof(ua));
+
+    /* String length matches reference. */
+    if (n != (int)ua_encoded_mainnet_len) {
+        fprintf(stderr, "  FAIL: orchard_encode_ua_raw length: expected %zu, got %d\n",
+                ua_encoded_mainnet_len, n);
+        total_tests++;
+        return;
+    }
+    /* String content matches byte-for-byte. */
+    if (memcmp(ua, ua_encoded_mainnet, ua_encoded_mainnet_len) != 0) {
+        fprintf(stderr, "  FAIL: orchard_encode_ua_raw\n");
+        fprintf(stderr, "    expected: %s\n", ua_encoded_mainnet);
+        fprintf(stderr, "    got:      %s\n", ua);
+        total_tests++;
+        return;
+    }
+    printf("  PASS: orchard_encode_ua_raw (mainnet) → %s\n", ua);
+    total_tests++;
+    passed_tests++;
+}
+
 /* ── Main ── */
 
 int main(void) {
@@ -475,6 +506,7 @@ int main(void) {
     test_redpallas_extra();
     test_f4jumble_inverse();
     test_orchard_note_commit();
+    test_orchard_encode_ua_raw();
 
     printf("\n=== Results: %d/%d tests passed ===\n", passed_tests, total_tests);
 

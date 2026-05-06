@@ -1006,4 +1006,119 @@ fn generate_note_commit_vectors(out: &mut String) {
     write_vector(out, "note_commit_rho", &rho_bytes);
     write_vector(out, "note_commit_rseed", &rseed_bytes);
     write_vector(out, "note_commit_expected_cmx", &cmx_bytes);
+
+    // ── Encoded Unified Address (ZIP-316, Orchard-only) ──
+    // Same recipient bytes, encoded as the canonical UA string. The on-device
+    // signer must reproduce this byte-for-byte from (d, pk_d, hrp) to display
+    // recipients to the user. The orchard crate exposes the receiver bytes
+    // via Address::to_raw_address_bytes(); the ZIP-316 framing (typecode 0x03,
+    // length 43, HRP padding, F4Jumble, bech32m) is implemented inline below.
+    let recipient_bytes = addr_bytes; // already extracted
+
+    fn encode_orchard_ua(d: &[u8; 11], pk_d: &[u8; 32], hrp: &str) -> String {
+        use f4jumble::f4jumble;
+
+        let mut raw: Vec<u8> = Vec::with_capacity(2 + 11 + 32 + 16);
+        raw.push(0x03); // Orchard typecode
+        raw.push(43);   // length
+        raw.extend_from_slice(d);
+        raw.extend_from_slice(pk_d);
+        // ZIP-316 HRP padding: pad to 16 bytes with zeros
+        let mut hrp_padded = [0u8; 16];
+        let hlen = hrp.len().min(16);
+        hrp_padded[..hlen].copy_from_slice(&hrp.as_bytes()[..hlen]);
+        raw.extend_from_slice(&hrp_padded);
+        // F4Jumble (length 61)
+        let jumbled = f4jumble(&raw).expect("f4jumble");
+        // 8 → 5-bit conversion
+        let mut data5: Vec<u8> = Vec::new();
+        let mut val: u32 = 0;
+        let mut bits: u32 = 0;
+        for &b in &jumbled {
+            val = (val << 8) | (b as u32);
+            bits += 8;
+            while bits >= 5 {
+                bits -= 5;
+                data5.push(((val >> bits) & 0x1F) as u8);
+            }
+        }
+        if bits > 0 {
+            data5.push(((val << (5 - bits)) & 0x1F) as u8);
+        }
+        bech32_encode_inline(hrp, &data5)
+    }
+
+    fn bech32_encode_inline(hrp: &str, data5: &[u8]) -> String {
+        // Bech32m polymod constant for the M-variant.
+        const BECH32M_CONST: u32 = 0x2bc830a3;
+        const CHARSET: &[u8; 32] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+
+        fn polymod(values: &[u8]) -> u32 {
+            const GEN: [u32; 5] = [
+                0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3,
+            ];
+            let mut chk: u32 = 1;
+            for &v in values {
+                let b = chk >> 25;
+                chk = ((chk & 0x1ffffff) << 5) ^ (v as u32);
+                for i in 0..5 {
+                    if (b >> i) & 1 == 1 {
+                        chk ^= GEN[i];
+                    }
+                }
+            }
+            chk
+        }
+        fn hrp_expand(hrp: &str) -> Vec<u8> {
+            let bytes = hrp.as_bytes();
+            let mut out = Vec::with_capacity(bytes.len() * 2 + 1);
+            for &b in bytes {
+                out.push(b >> 5);
+            }
+            out.push(0);
+            for &b in bytes {
+                out.push(b & 0x1f);
+            }
+            out
+        }
+
+        let mut combined = hrp_expand(hrp);
+        combined.extend_from_slice(data5);
+        combined.extend_from_slice(&[0u8; 6]);
+        let mod_val = polymod(&combined) ^ BECH32M_CONST;
+        let mut checksum = [0u8; 6];
+        for i in 0..6 {
+            checksum[i] = ((mod_val >> (5 * (5 - i))) & 0x1f) as u8;
+        }
+
+        let mut s = String::with_capacity(hrp.len() + 1 + data5.len() + 6);
+        s.push_str(hrp);
+        s.push('1');
+        for &v in data5 {
+            s.push(CHARSET[v as usize] as char);
+        }
+        for &v in &checksum {
+            s.push(CHARSET[v as usize] as char);
+        }
+        s
+    }
+
+    let d_bytes: [u8; 11] = recipient_bytes[..11].try_into().unwrap();
+    let pk_d_bytes: [u8; 32] = recipient_bytes[11..].try_into().unwrap();
+    let ua_string = encode_orchard_ua(&d_bytes, &pk_d_bytes, "u");
+
+    // Emit as a C string literal.
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "/* Orchard-only Unified Address encoded from the recipient above (mainnet HRP \"u\"). */"
+    )
+    .unwrap();
+    writeln!(out, "static const char ua_encoded_mainnet[] = \"{}\";", ua_string).unwrap();
+    writeln!(
+        out,
+        "static const size_t ua_encoded_mainnet_len = {};",
+        ua_string.len()
+    )
+    .unwrap();
 }

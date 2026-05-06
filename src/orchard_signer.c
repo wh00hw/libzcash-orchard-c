@@ -54,6 +54,14 @@ OrchardSignerError orchard_signer_feed_meta(OrchardSignerCtx *ctx,
     }
     memzero(sapling_empty, sizeof(sapling_empty));
 
+    /* Per-action display storage is bounded; reject early if the tx claims
+     * more outputs than we can display, rather than failing partway through
+     * the action stream. */
+    if (total_actions > ORCHARD_SIGNER_MAX_ACTIONS) {
+        memzero(&ctx->tx_meta, sizeof(ctx->tx_meta));
+        return SIGNER_ERR_TOO_MANY_ACTIONS;
+    }
+
     zip244_actions_init(&ctx->actions_state);
     ctx->has_meta = true;
     ctx->actions_expected = total_actions;
@@ -209,6 +217,12 @@ OrchardSignerError orchard_signer_feed_action_with_note(
     if (ctx->actions_received >= ctx->actions_expected) {
         return SIGNER_ERR_BAD_STATE;
     }
+    if (ctx->actions_received >= ORCHARD_SIGNER_MAX_ACTIONS) {
+        /* Per-action display storage is bounded; a tx with more outputs
+         * than ORCHARD_SIGNER_MAX_ACTIONS cannot be safely displayed. */
+        orchard_signer_reset(ctx);
+        return SIGNER_ERR_TOO_MANY_ACTIONS;
+    }
     if (action_len != ORCHARD_ACTION_TOTAL_SIZE) {
         return SIGNER_ERR_BAD_ACTION;
     }
@@ -238,7 +252,41 @@ OrchardSignerError orchard_signer_feed_action_with_note(
         return SIGNER_ERR_BAD_ACTION;
     }
 
+    /* Capture the display info so the firmware UI can render this output
+     * to the user, and so verify() can later refuse to advance to VERIFIED
+     * unless every captured action has been explicitly confirmed. */
+    OrchardActionDisplay *disp = &ctx->actions_display[ctx->actions_received];
+    memcpy(disp->recipient, recipient, 43);
+    disp->value = value;
+    disp->confirmed = false;
+
     ctx->actions_received++;
+    return SIGNER_OK;
+}
+
+OrchardSignerError orchard_signer_get_action_display(
+    const OrchardSignerCtx *ctx,
+    uint16_t idx,
+    uint8_t recipient_out[43],
+    uint64_t *value_out)
+{
+    if (idx >= ctx->actions_received) {
+        return SIGNER_ERR_INVALID_ACTION_INDEX;
+    }
+    const OrchardActionDisplay *disp = &ctx->actions_display[idx];
+    if (recipient_out) memcpy(recipient_out, disp->recipient, 43);
+    if (value_out)     *value_out = disp->value;
+    return SIGNER_OK;
+}
+
+OrchardSignerError orchard_signer_confirm_action(
+    OrchardSignerCtx *ctx,
+    uint16_t idx)
+{
+    if (idx >= ctx->actions_received) {
+        return SIGNER_ERR_INVALID_ACTION_INDEX;
+    }
+    ctx->actions_display[idx].confirmed = true;
     return SIGNER_OK;
 }
 
@@ -255,6 +303,19 @@ OrchardSignerError orchard_signer_verify(OrchardSignerCtx *ctx,
 
     if (ctx->actions_received != ctx->actions_expected) {
         return SIGNER_ERR_BAD_STATE;
+    }
+
+    /* No-blind-signing invariant: every action's (recipient, value) must
+     * have been displayed to the user via orchard_signer_get_action_display()
+     * AND explicitly confirmed via orchard_signer_confirm_action(). The
+     * library refuses to advance to SIGNER_VERIFIED until that is true.
+     * orchard_signer_sign() in turn refuses to produce a signature unless
+     * the context is in SIGNER_VERIFIED — so a hostile firmware that skips
+     * the UI step cannot extract a signature. */
+    for (uint16_t i = 0; i < ctx->actions_received; i++) {
+        if (!ctx->actions_display[i].confirmed) {
+            return SIGNER_ERR_ACTION_NOT_CONFIRMED;
+        }
     }
 
     /* Compute the full ZIP-244 sighash from metadata + actions */

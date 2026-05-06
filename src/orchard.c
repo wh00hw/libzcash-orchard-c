@@ -622,6 +622,65 @@ int orchard_derive_unified_address(
 }
 
 /* ---------------------------------------------------------------------- */
+/*  Orchard-only Unified Address encoding from a raw (d, pk_d) pair       */
+/* ---------------------------------------------------------------------- */
+/*
+ * Used by the on-device signer to render an arbitrary recipient (extracted
+ * from a PCZT, NOT necessarily belonging to the device's own key) so the
+ * user can verify it on screen before authorizing a signature. ZIP-316:
+ *
+ *   raw_ua = 0x03 || 43 || d || pk_d || hrp_padded_to_16
+ *   ua     = bech32m(hrp, F4Jumble(raw_ua))
+ *
+ * No key derivation runs here — this function only encodes.
+ */
+int orchard_encode_ua_raw(
+    const uint8_t d[11],
+    const uint8_t pk_d[32],
+    const char* hrp,
+    char* ua_out,
+    size_t ua_out_len)
+{
+    if (!d || !pk_d || !hrp || !ua_out || ua_out_len < 200) return 0;
+
+    uint8_t raw_ua[80];
+    memzero(raw_ua, sizeof(raw_ua));
+    size_t raw_len = 0;
+
+    /* Orchard receiver (typecode 0x03), length 43 */
+    raw_ua[raw_len++] = 0x03;
+    raw_ua[raw_len++] = 43;
+    memcpy(raw_ua + raw_len, d, 11);
+    raw_len += 11;
+    memcpy(raw_ua + raw_len, pk_d, 32);
+    raw_len += 32;
+    /* raw_len = 45 (Orchard-only) */
+
+    /* ZIP-316 padding: HRP padded to 16 bytes with zeros */
+    {
+        uint8_t hrp_padded[16] = {0};
+        size_t hlen = strlen(hrp);
+        if (hlen > 16) hlen = 16;
+        memcpy(hrp_padded, hrp, hlen);
+        memcpy(raw_ua + raw_len, hrp_padded, 16);
+        raw_len += 16;
+    }
+    /* raw_len = 61 */
+
+    f4jumble(raw_ua, raw_len);
+
+    uint8_t data5[160];
+    size_t data5_len = convert_bits_8to5(raw_ua, raw_len, data5, sizeof(data5));
+
+    int ok = bech32_encode(ua_out, hrp, data5, data5_len, BECH32_ENCODING_BECH32M);
+    memzero(raw_ua, sizeof(raw_ua));
+    memzero(data5, sizeof(data5));
+    if (!ok) return 0;
+
+    return (int)strlen(ua_out);
+}
+
+/* ---------------------------------------------------------------------- */
 /*  Orchard NoteCommitment (cmx) recomputation                            */
 /* ---------------------------------------------------------------------- */
 /*

@@ -16,6 +16,18 @@
 #include <stddef.h>
 #include "zip244.h"
 
+/**
+ * Maximum number of Orchard actions the signer will track for per-action
+ * user confirmation. A transaction with more actions is rejected at
+ * feed_meta() time. This bounds the per-context display storage at
+ * MAX_ACTIONS * sizeof(OrchardActionDisplay) ≈ 16 * 52 = 832 bytes.
+ *
+ * Practically every Zcash wallet today produces 2..4 Orchard actions
+ * per transaction; 16 is a generous ceiling that still fits comfortably
+ * in 256 KB of SRAM.
+ */
+#define ORCHARD_SIGNER_MAX_ACTIONS 16
+
 typedef enum {
     SIGNER_IDLE,                     /* Waiting for metadata */
     SIGNER_RECEIVING_TRANSPARENT,    /* Collecting transparent inputs/outputs (v3) */
@@ -42,7 +54,26 @@ typedef enum {
                                             (companion-claimed recipient does not
                                             match the recipient committed in the
                                             output note — siphoning attempt) */
+    SIGNER_ERR_TOO_MANY_ACTIONS,         /* tx exceeds ORCHARD_SIGNER_MAX_ACTIONS */
+    SIGNER_ERR_INVALID_ACTION_INDEX,     /* confirm/get on out-of-range index */
+    SIGNER_ERR_ACTION_NOT_CONFIRMED,     /* verify() called before user confirmed
+                                            every output's recipient/value */
 } OrchardSignerError;
+
+/**
+ * Per-action display info captured from feed_action_with_note().
+ * The firmware reads these via orchard_signer_get_action_display() and is
+ * required to call orchard_signer_confirm_action() once the user has
+ * approved each output's recipient/value on the device's UI. Without all
+ * actions confirmed, orchard_signer_verify() refuses to advance to
+ * SIGNER_VERIFIED, which in turn prevents orchard_signer_sign() from
+ * producing a signature — the "no blind signing" invariant.
+ */
+typedef struct {
+    uint8_t recipient[43];   /* d[11] || pk_d[32] */
+    uint64_t value;          /* output note value in zatoshis */
+    bool confirmed;          /* set by orchard_signer_confirm_action() */
+} OrchardActionDisplay;
 
 typedef struct {
     OrchardSignerState state;
@@ -58,6 +89,11 @@ typedef struct {
     uint8_t verified_sighash[32];
     /** Session coin_type set by FvkReq. 0 = unset (backward compat). */
     uint32_t coin_type;
+    /** Per-action recipient/value/confirmation captured by feed_action_with_note(),
+     *  consumed by the firmware UI via get_action_display() / confirm_action().
+     *  orchard_signer_verify() refuses to transition to VERIFIED unless every
+     *  entry [0 .. actions_expected) has confirmed == true. */
+    OrchardActionDisplay actions_display[ORCHARD_SIGNER_MAX_ACTIONS];
 } OrchardSignerCtx;
 
 /**
@@ -124,6 +160,44 @@ OrchardSignerError orchard_signer_feed_action_with_note(
     const uint8_t recipient[43],
     uint64_t value,
     const uint8_t rseed[32]);
+
+/**
+ * Read out the (recipient, value) the firmware needs to display for a
+ * given action index, captured during feed_action_with_note().
+ *
+ * @param ctx           Signing context (any state after feed_action_with_note)
+ * @param idx           Action index, 0 .. actions_received - 1
+ * @param recipient_out 43-byte buffer (d || pk_d)
+ * @param value_out     output note value in zatoshis
+ *
+ * @return SIGNER_OK, or SIGNER_ERR_INVALID_ACTION_INDEX if idx is out of range.
+ */
+OrchardSignerError orchard_signer_get_action_display(
+    const OrchardSignerCtx *ctx,
+    uint16_t idx,
+    uint8_t recipient_out[43],
+    uint64_t *value_out);
+
+/**
+ * Mark action `idx` as confirmed by the user.
+ *
+ * The firmware MUST call this for every action [0 .. actions_received - 1]
+ * after the user has approved the corresponding recipient and value on
+ * the device UI. Without all actions confirmed, orchard_signer_verify()
+ * returns SIGNER_ERR_ACTION_NOT_CONFIRMED and refuses to transition to
+ * SIGNER_VERIFIED, so orchard_signer_sign() will fail with NOT_VERIFIED.
+ *
+ * Confirmation is monotonic: re-calling confirm on an already-confirmed
+ * index is a no-op (returns OK). To revoke, call orchard_signer_reset().
+ *
+ * @param ctx  Signing context
+ * @param idx  Action index, 0 .. actions_received - 1
+ *
+ * @return SIGNER_OK, or SIGNER_ERR_INVALID_ACTION_INDEX if idx is out of range.
+ */
+OrchardSignerError orchard_signer_confirm_action(
+    OrchardSignerCtx *ctx,
+    uint16_t idx);
 
 /**
  * Begin transparent digest verification (v3).

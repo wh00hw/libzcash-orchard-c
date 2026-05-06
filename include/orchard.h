@@ -54,6 +54,32 @@ int orchard_derive_unified_address(
     uint8_t* d_out,
     uint8_t* pk_d_out);
 
+/**
+ * Encode a (d, pk_d) pair as an Orchard-only Unified Address (ZIP-316).
+ *
+ * Used by the on-device signer to render an arbitrary recipient (one
+ * extracted from a PCZT, NOT necessarily belonging to the device's own
+ * key) so the user can verify it on-screen before authorizing the
+ * signature. This is the encoding step that closes the "blind signing"
+ * gap together with on-device cmx verification.
+ *
+ *   raw_ua = 0x03 || 43 || d || pk_d || hrp_padded_to_16
+ *   ua = bech32m(hrp, F4Jumble(raw_ua))
+ *
+ * @param d           recipient diversifier (11 bytes)
+ * @param pk_d        recipient transmission key (32 bytes, repr_P)
+ * @param hrp         "u" for mainnet, "utest" for testnet
+ * @param ua_out      output buffer for the bech32m string (must be >= 200 B)
+ * @param ua_out_len  size of ua_out
+ * @return string length on success, 0 on error
+ */
+int orchard_encode_ua_raw(
+    const uint8_t d[11],
+    const uint8_t pk_d[32],
+    const char* hrp,
+    char* ua_out,
+    size_t ua_out_len);
+
 // F4Jumble encoding / decoding (ZIP-316)
 void f4jumble(uint8_t* data, size_t len);
 void f4jumble_inv(uint8_t* data, size_t len);

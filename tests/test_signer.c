@@ -219,6 +219,177 @@ static void test_note_commit_wrong_action_size_rejected(void) {
     printf("  PASS: invalid action length rejected\n");
 }
 
+/* ----------------------------------------------------------------------- */
+/*  No-blind-signing invariant                                             */
+/* ----------------------------------------------------------------------- */
+/*
+ * orchard_signer_verify() must refuse to advance to SIGNER_VERIFIED unless
+ * every captured action has been explicitly confirmed via
+ * orchard_signer_confirm_action(). Without VERIFIED, orchard_signer_sign()
+ * returns SIGNER_ERR_NOT_VERIFIED and no signature is produced — so a
+ * hostile firmware that skips the per-output user-confirmation UI cannot
+ * extract a signature.
+ */
+
+static void compute_sighash(OrchardSignerCtx *src, uint8_t out[32]) {
+    /* Snapshot the actions_state so the streaming hashers don't get
+     * finalized in `src` itself. zip244_shielded_sighash() finalizes them. */
+    Zip244ActionsState snap = src->actions_state;
+    zip244_shielded_sighash(&src->tx_meta, &snap, out);
+}
+
+static void test_verify_refuses_without_any_confirm(void) {
+    OrchardSignerCtx ctx;
+    uint8_t wire[125];
+    start_session_for_one_action(&ctx, wire);
+
+    uint8_t action[820];
+    build_synthetic_action(action, note_commit_rho, note_commit_expected_cmx);
+    OrchardSignerError err = orchard_signer_feed_action_with_note(
+        &ctx, action, sizeof(action),
+        note_commit_recipient, note_commit_value, note_commit_rseed);
+    assert(err == SIGNER_OK);
+
+    /* Compute the sighash that the companion would also send. */
+    uint8_t sighash[32];
+    compute_sighash(&ctx, sighash);
+
+    /* No confirm_action() called → verify must refuse. */
+    err = orchard_signer_verify(&ctx, sighash);
+    assert(err == SIGNER_ERR_ACTION_NOT_CONFIRMED);
+    assert(ctx.state == SIGNER_RECEIVING_ACTIONS);  /* not advanced */
+    printf("  PASS: verify refuses (NOT_CONFIRMED) when no action confirmed\n");
+}
+
+static void test_verify_accepts_after_confirm(void) {
+    OrchardSignerCtx ctx;
+    uint8_t wire[125];
+    start_session_for_one_action(&ctx, wire);
+
+    uint8_t action[820];
+    build_synthetic_action(action, note_commit_rho, note_commit_expected_cmx);
+    assert(orchard_signer_feed_action_with_note(
+        &ctx, action, sizeof(action),
+        note_commit_recipient, note_commit_value, note_commit_rseed) == SIGNER_OK);
+
+    uint8_t sighash[32];
+    compute_sighash(&ctx, sighash);
+
+    /* Firmware reads the display, asks the user, marks confirmed. */
+    uint8_t recipient[43];
+    uint64_t value;
+    assert(orchard_signer_get_action_display(&ctx, 0, recipient, &value) == SIGNER_OK);
+    assert(memcmp(recipient, note_commit_recipient, 43) == 0);
+    assert(value == note_commit_value);
+    assert(orchard_signer_confirm_action(&ctx, 0) == SIGNER_OK);
+
+    /* Now verify must succeed and transition to VERIFIED. */
+    OrchardSignerError err = orchard_signer_verify(&ctx, sighash);
+    assert(err == SIGNER_OK);
+    assert(ctx.state == SIGNER_VERIFIED);
+    printf("  PASS: verify advances to VERIFIED once all actions confirmed\n");
+}
+
+static void test_verify_refuses_partial_confirm(void) {
+    /* Three actions captured, only one confirmed → verify must refuse. */
+    OrchardSignerCtx ctx;
+    orchard_signer_init(&ctx);
+
+    uint8_t empty[32];
+    zip244_sapling_empty_digest(empty);
+    uint8_t wire[125];
+    build_tx_meta_wire(wire, empty);
+    assert(orchard_signer_feed_meta(&ctx, wire, 125, 3) == SIGNER_OK);
+
+    uint8_t action[820];
+    for (int i = 0; i < 3; i++) {
+        build_synthetic_action(action, note_commit_rho, note_commit_expected_cmx);
+        assert(orchard_signer_feed_action_with_note(
+            &ctx, action, sizeof(action),
+            note_commit_recipient, note_commit_value, note_commit_rseed) == SIGNER_OK);
+    }
+
+    uint8_t sighash[32];
+    compute_sighash(&ctx, sighash);
+
+    /* Confirm only action 1 (skipping 0 and 2). */
+    assert(orchard_signer_confirm_action(&ctx, 1) == SIGNER_OK);
+
+    OrchardSignerError err = orchard_signer_verify(&ctx, sighash);
+    assert(err == SIGNER_ERR_ACTION_NOT_CONFIRMED);
+    assert(ctx.state == SIGNER_RECEIVING_ACTIONS);
+    printf("  PASS: verify refuses when 1 of 3 actions confirmed\n");
+}
+
+static void test_invalid_action_index(void) {
+    OrchardSignerCtx ctx;
+    uint8_t wire[125];
+    start_session_for_one_action(&ctx, wire);
+
+    /* No action fed yet — index 0 is invalid. */
+    uint8_t recipient[43];
+    uint64_t value;
+    assert(orchard_signer_get_action_display(&ctx, 0, recipient, &value) ==
+           SIGNER_ERR_INVALID_ACTION_INDEX);
+    assert(orchard_signer_confirm_action(&ctx, 0) ==
+           SIGNER_ERR_INVALID_ACTION_INDEX);
+
+    /* Feed one action: now index 0 is valid, but 1 is not. */
+    uint8_t action[820];
+    build_synthetic_action(action, note_commit_rho, note_commit_expected_cmx);
+    assert(orchard_signer_feed_action_with_note(
+        &ctx, action, sizeof(action),
+        note_commit_recipient, note_commit_value, note_commit_rseed) == SIGNER_OK);
+    assert(orchard_signer_get_action_display(&ctx, 1, recipient, &value) ==
+           SIGNER_ERR_INVALID_ACTION_INDEX);
+    assert(orchard_signer_confirm_action(&ctx, 1) ==
+           SIGNER_ERR_INVALID_ACTION_INDEX);
+    printf("  PASS: invalid action index rejected for both display and confirm\n");
+}
+
+static void test_too_many_actions_rejected_at_meta(void) {
+    OrchardSignerCtx ctx;
+    orchard_signer_init(&ctx);
+
+    uint8_t empty[32];
+    zip244_sapling_empty_digest(empty);
+    uint8_t wire[125];
+    build_tx_meta_wire(wire, empty);
+
+    OrchardSignerError err = orchard_signer_feed_meta(
+        &ctx, wire, 125, ORCHARD_SIGNER_MAX_ACTIONS + 1);
+    assert(err == SIGNER_ERR_TOO_MANY_ACTIONS);
+    /* Context must remain in IDLE — meta was rejected. */
+    assert(ctx.state == SIGNER_IDLE);
+    printf("  PASS: tx with > MAX_ACTIONS outputs rejected at feed_meta\n");
+}
+
+static void test_sign_refuses_without_verify(void) {
+    /* Direct check that sign() refuses if state never reached VERIFIED.
+     * Belt-and-braces: the same invariant is enforced inside verify(),
+     * but sign() also short-circuits to NOT_VERIFIED if a confused
+     * caller skips verify(). */
+    OrchardSignerCtx ctx;
+    uint8_t wire[125];
+    start_session_for_one_action(&ctx, wire);
+
+    uint8_t action[820];
+    build_synthetic_action(action, note_commit_rho, note_commit_expected_cmx);
+    assert(orchard_signer_feed_action_with_note(
+        &ctx, action, sizeof(action),
+        note_commit_recipient, note_commit_value, note_commit_rseed) == SIGNER_OK);
+
+    uint8_t sighash[32];
+    compute_sighash(&ctx, sighash);
+
+    uint8_t ask[32] = {0};
+    uint8_t alpha[32] = {0};
+    uint8_t sig[64], rk[32];
+    OrchardSignerError err = orchard_signer_sign(&ctx, sighash, ask, alpha, sig, rk);
+    assert(err == SIGNER_ERR_NOT_VERIFIED);
+    printf("  PASS: sign refuses (NOT_VERIFIED) if state never reached VERIFIED\n");
+}
+
 int main(void) {
     printf("Orchard signer / Sapling-empty-bundle invariant tests:\n");
     test_sapling_empty_accepted();
@@ -231,6 +402,14 @@ int main(void) {
     test_note_commit_attacker_recipient_rejected();
     test_note_commit_attacker_value_rejected();
     test_note_commit_wrong_action_size_rejected();
+
+    printf("\nOrchard signer / no-blind-signing invariant tests:\n");
+    test_verify_refuses_without_any_confirm();
+    test_verify_accepts_after_confirm();
+    test_verify_refuses_partial_confirm();
+    test_invalid_action_index();
+    test_too_many_actions_rejected_at_meta();
+    test_sign_refuses_without_verify();
     printf("All signer tests passed.\n");
     return 0;
 }
