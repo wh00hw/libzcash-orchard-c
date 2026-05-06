@@ -60,3 +60,39 @@ void f4jumble_inv(uint8_t* data, size_t len);
 
 // FF1-AES-256 encrypt 11 bytes (for diversifier derivation)
 void ff1_aes256_encrypt(const uint8_t key[32], const uint8_t in[11], uint8_t out[11]);
+
+/**
+ * Compute the Orchard NoteCommitment x-coordinate (cmx) for an output note.
+ *
+ *   cmx = Extract_P(NoteCommit_rcm^Orchard(g_d, pk_d, v, rho, psi))
+ *
+ * with rcm = ToScalar(PRF_expand(rseed, [0x05] || rho))
+ *      psi = ToBase(PRF_expand(rseed, [0x09] || rho))
+ *
+ * defined in the Zcash protocol specification, §§ 4.7.3 and 5.4.8.4.
+ *
+ * Used by the on-device Orchard signer to verify that the cmx field of a
+ * streamed action commits to the (recipient, value, rseed) the companion
+ * claims it commits to. A hostile companion that tries to substitute a
+ * different recipient must produce a cmx that mismatches the device's
+ * recomputation, which the signer detects and rejects.
+ *
+ * @param d        recipient diversifier (11 bytes), as encoded in the
+ *                 raw Orchard payment-address form `d || pk_d`
+ * @param pk_d     recipient transmission key (32 bytes), repr_P-encoded
+ *                 (Pallas point compressed: x_le with y_lsb in bit 255)
+ * @param value    output note value in zatoshis
+ * @param rho      action's nullifier (32 bytes); used as rho for the
+ *                 output note's NoteCommit input (Orchard's split-action
+ *                 design re-uses the action nullifier)
+ * @param rseed    random seed for the output note (32 bytes); must be
+ *                 the value the constructor used to derive psi/rcm
+ * @param cmx_out  32-byte output, x-coordinate of NoteCommitment in LE form
+ */
+void orchard_compute_cmx(
+    const uint8_t d[11],
+    const uint8_t pk_d[32],
+    uint64_t value,
+    const uint8_t rho[32],
+    const uint8_t rseed[32],
+    uint8_t cmx_out[32]);

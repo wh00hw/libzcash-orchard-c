@@ -38,6 +38,10 @@ typedef enum {
     SIGNER_ERR_TRANSPARENT_MISMATCH,     /* Transparent digest mismatch (v3) */
     SIGNER_ERR_SAPLING_NOT_EMPTY,        /* sapling_digest != empty-bundle constant
                                             (Orchard-only invariant violation) */
+    SIGNER_ERR_NOTE_COMMITMENT_MISMATCH, /* device-recomputed cmx != action.cmx
+                                            (companion-claimed recipient does not
+                                            match the recipient committed in the
+                                            output note — siphoning attempt) */
 } OrchardSignerError;
 
 typedef struct {
@@ -87,6 +91,39 @@ OrchardSignerError orchard_signer_feed_meta(OrchardSignerCtx *ctx,
  */
 OrchardSignerError orchard_signer_feed_action(OrchardSignerCtx *ctx,
                                                const uint8_t *action_data, size_t action_len);
+
+/**
+ * Feed one action together with the unencrypted output-note plaintext, and
+ * verify that the action's cmx field commits to the claimed recipient.
+ *
+ * Without this verification, a hostile companion can put a cmx that commits
+ * to an attacker recipient inside an action while telling the device's UI
+ * "send to <Mario>" — the device would hash the action bytes correctly,
+ * produce a valid sighash, and sign a transaction whose actual on-chain
+ * effect is to pay the attacker. The defence is to recompute cmx on-device
+ * from the (recipient, value, rseed) the companion claims, and require it
+ * to match the cmx field at offset 96 of the action data byte-for-byte.
+ *
+ * Per Orchard's split-action design, the rho input to the output note's
+ * NoteCommit is the action's nullifier (offset 32 of action_data); this
+ * function uses that automatically — the caller does not pass rho.
+ *
+ * On mismatch: returns SIGNER_ERR_NOTE_COMMITMENT_MISMATCH and resets the
+ * context so the partial action stream is discarded.
+ *
+ * @param ctx          Signing context (must be in RECEIVING_ACTIONS)
+ * @param action_data  Raw action bytes (820)
+ * @param action_len   Length of action_data
+ * @param recipient    43 bytes = d[11] || pk_d[32] (raw Orchard address)
+ * @param value        Output note value in zatoshis
+ * @param rseed        32-byte note rseed
+ */
+OrchardSignerError orchard_signer_feed_action_with_note(
+    OrchardSignerCtx *ctx,
+    const uint8_t *action_data, size_t action_len,
+    const uint8_t recipient[43],
+    uint64_t value,
+    const uint8_t rseed[32]);
 
 /**
  * Begin transparent digest verification (v3).

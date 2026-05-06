@@ -821,13 +821,18 @@ void sinsemilla_hash_to_point(
 
     bool has_table = (s_sinsemilla_lookup != NULL);
 
-    size_t num_chunks = num_bits / 10;
+    /* Per the Sinsemilla specification, a partial final chunk is zero-padded
+     * to K=10 bits and processed like a full chunk. */
+    size_t num_full_chunks = num_bits / 10;
+    size_t remainder_bits  = num_bits % 10;
+    size_t num_chunks      = num_full_chunks + (remainder_bits > 0 ? 1 : 0);
     for(size_t i = 0; i < num_chunks; i++) {
         pallas_report(35 + (uint8_t)(i * 35 / num_chunks),
             has_table ? "Sinsemilla (fast)..." : "Sinsemilla (slow)...");
 
         uint32_t chunk = 0;
-        for(int b = 0; b < 10; b++) {
+        int chunk_bits = (i < num_full_chunks) ? 10 : (int)remainder_bits;
+        for(int b = 0; b < chunk_bits; b++) {
             size_t bit_idx = i * 10 + b;
             if(msg_bits[bit_idx / 8] & (1 << (bit_idx % 8))) {
                 chunk |= (1 << b);

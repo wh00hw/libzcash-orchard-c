@@ -8,6 +8,7 @@ add_test(NAME test_orchard COMMAND test_orchard)
 
 add_executable(test_signer test_signer.c)
 target_link_libraries(test_signer PRIVATE zcash-orchard-c)
+target_include_directories(test_signer PRIVATE ${CMAKE_SOURCE_DIR}/tests)
 add_test(NAME test_signer COMMAND test_signer)
 
 # test_vectors needs its own copy of the library compiled with TEST_DETERMINISTIC_NONCE

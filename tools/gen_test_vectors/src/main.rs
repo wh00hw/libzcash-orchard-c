@@ -943,9 +943,67 @@ fn main() {
     generate_ff1_real_dk_vectors(&mut out);
     generate_redpallas_extra_vectors(&mut out);
     generate_f4jumble_inv_vectors(&mut out);
+    generate_note_commit_vectors(&mut out);
 
     writeln!(out, "\n#endif /* TEST_VECTORS_H */").unwrap();
 
     // Write to stdout
     std::io::stdout().write_all(out.as_bytes()).unwrap();
+}
+
+// ─── Orchard Note Commitment (cmx) ──────────────────────────────────────────
+//
+// Generates one KAT for orchard_compute_cmx: derives a real recipient address
+// from the canonical 32-byte test seed, picks fixed (value, rho, rseed), and
+// emits the 43-byte raw recipient (d || pk_d), value, rho, rseed, and the
+// expected cmx as computed by the orchard crate's Note::commitment().
+fn generate_note_commit_vectors(out: &mut String) {
+    use orchard::keys::{FullViewingKey, SpendingKey};
+    use orchard::note::{ExtractedNoteCommitment, RandomSeed, Rho};
+    use orchard::value::NoteValue;
+    use orchard::Note;
+
+    writeln!(out, "\n/* ── Orchard Note Commitment (cmx) ── */\n").unwrap();
+
+    // Same canonical seed used by other ZIP-32 vectors in this file.
+    let seed: [u8; 64] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+        0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c,
+        0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b,
+        0x3c, 0x3d, 0x3e, 0x3f,
+    ];
+
+    let sk = SpendingKey::from_zip32_seed(&seed, 133, 0u32.try_into().unwrap())
+        .expect("valid spending key");
+    let fvk = FullViewingKey::from(&sk);
+    let address = fvk.address_at(0u32, orchard::keys::Scope::External);
+    let addr_bytes = address.to_raw_address_bytes();
+
+    // Fixed test inputs.
+    let value_zats: u64 = 12_345_678;
+    let rho_bytes: [u8; 32] = [
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+        0xff, 0x00,
+    ];
+    let rseed_bytes: [u8; 32] = [
+        0xca, 0xfe, 0xba, 0xbe, 0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
+        0x17, 0x18,
+    ];
+
+    let rho = Rho::from_bytes(&rho_bytes).expect("valid rho");
+    let rseed = RandomSeed::from_bytes(rseed_bytes, &rho).expect("valid rseed");
+    let note = Note::from_parts(address, NoteValue::from_raw(value_zats), rho, rseed)
+        .expect("valid note");
+    let commitment = note.commitment();
+    let cmx = ExtractedNoteCommitment::from(commitment);
+    let cmx_bytes = cmx.to_bytes();
+
+    write_vector(out, "note_commit_recipient", &addr_bytes); // 43 bytes = d[11] || pk_d[32]
+    writeln!(out, "static const uint64_t note_commit_value = {};", value_zats).unwrap();
+    write_vector(out, "note_commit_rho", &rho_bytes);
+    write_vector(out, "note_commit_rseed", &rseed_bytes);
+    write_vector(out, "note_commit_expected_cmx", &cmx_bytes);
 }

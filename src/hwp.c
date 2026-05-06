@@ -202,6 +202,29 @@ bool hwp_parse_tx_output(const uint8_t* payload, uint16_t len, HwpTxOutput* out)
     return true;
 }
 
+bool hwp_parse_action_v4(const uint8_t* output_data, uint16_t output_data_len,
+                         HwpActionV4* out) {
+    if(output_data_len != HWP_ACTION_DATA_SIZE_V4) return false;
+    /* Layout (903 bytes):
+     *   action[0..820]            -- 820 bytes ZIP-244 action data
+     *   recipient[820..863]       -- 43 bytes d[11] || pk_d[32]
+     *   value_le[863..871]        -- 8 bytes little-endian u64
+     *   rseed[871..903]           -- 32 bytes
+     */
+    out->action    = output_data;
+    out->recipient = output_data + HWP_ACTION_DATA_SIZE;
+    {
+        uint64_t v = 0;
+        const uint8_t* vp = output_data + HWP_ACTION_DATA_SIZE + 43;
+        for(int i = 7; i >= 0; i--) {
+            v = (v << 8) | vp[i];
+        }
+        out->value = v;
+    }
+    out->rseed = output_data + HWP_ACTION_DATA_SIZE + 43 + 8;
+    return true;
+}
+
 uint16_t hwp_encode_tx_output(uint8_t* payload, uint16_t output_index, uint16_t total_outputs,
                               const uint8_t* output_data, uint16_t output_data_len) {
     payload[0] = output_index & 0xFF;

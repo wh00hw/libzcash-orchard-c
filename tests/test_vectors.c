@@ -440,6 +440,22 @@ static void test_f4jumble_inverse(void) {
     assert_eq_bytes("F4Jumble inverse (round-trip)", f4j_inv_input, buf, f4j_inv_len);
 }
 
+/* ── Orchard NoteCommitment (cmx) ── */
+
+static void test_orchard_note_commit(void) {
+    printf("\nOrchard NoteCommitment (cmx, vs librustzcash Note::commitment):\n");
+
+    /* note_commit_recipient = d[11] || pk_d[32] (43 bytes raw Orchard address) */
+    const uint8_t* d    = note_commit_recipient;
+    const uint8_t* pk_d = note_commit_recipient + 11;
+
+    uint8_t cmx[32];
+    orchard_compute_cmx(d, pk_d, note_commit_value,
+                        note_commit_rho, note_commit_rseed, cmx);
+
+    assert_eq_bytes("orchard_compute_cmx", note_commit_expected_cmx, cmx, 32);
+}
+
 /* ── Main ── */
 
 int main(void) {
@@ -458,6 +474,7 @@ int main(void) {
     test_ff1_real_dk();
     test_redpallas_extra();
     test_f4jumble_inverse();
+    test_orchard_note_commit();
 
     printf("\n=== Results: %d/%d tests passed ===\n", passed_tests, total_tests);
 

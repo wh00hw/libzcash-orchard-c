@@ -620,3 +620,107 @@ int orchard_derive_unified_address(
 
     return (int)strlen(ua_out);
 }
+
+/* ---------------------------------------------------------------------- */
+/*  Orchard NoteCommitment (cmx) recomputation                            */
+/* ---------------------------------------------------------------------- */
+/*
+ *   cmx = Extract_P( NoteCommit_rcm^Orchard(g_d, pk_d, v, rho, psi) )
+ *
+ * with
+ *   g_d = DiversifyHash(d)
+ *   rcm = ToScalar( PRF^expand(rseed, [0x05] || rho) )
+ *   psi = ToBase  ( PRF^expand(rseed, [0x09] || rho) )
+ *
+ * The Sinsemilla input is the bit string (LSB-first per byte):
+ *   repr_P(g_d) (256 bits)
+ *   || repr_P(pk_d) (256 bits)
+ *   || I2LEBSP_64(v) (64 bits)
+ *   || I2LEBSP_255(rho) (255 bits)
+ *   || I2LEBSP_255(psi) (255 bits)
+ * Total 1086 bits, packed into 136 bytes.
+ *
+ * Used by the on-device signer to verify the cmx field of each streamed
+ * Orchard action against the recipient/value/rseed the companion claims it
+ * commits to. A hostile companion that swaps the recipient must also produce
+ * a matching cmx; this is computationally infeasible.
+ */
+void orchard_compute_cmx(
+    const uint8_t d[11],
+    const uint8_t pk_d[32],
+    uint64_t value,
+    const uint8_t rho[32],
+    const uint8_t rseed[32],
+    uint8_t cmx_out[32])
+{
+    /* 1. g_d = DiversifyHash(d) and its repr_P encoding */
+    pallas_point g_d;
+    pallas_hash_to_curve(&g_d, "z.cash:Orchard-gd", d, 11);
+    uint8_t g_d_repr[32];
+    bn_write_le(&g_d.x, g_d_repr);
+    if (g_d.y.val[0] & 1) g_d_repr[31] |= 0x80;
+
+    /* 2. rcm = ToScalar(PRF^expand(rseed, [0x05] || rho)) */
+    uint8_t prf_in[1 + 32];
+    uint8_t prf_out[64];
+    uint8_t rcm_le[32];
+    prf_in[0] = 0x05;
+    memcpy(prf_in + 1, rho, 32);
+    prf_expand(rseed, prf_in, sizeof(prf_in), prf_out);
+    to_scalar(prf_out, rcm_le);
+
+    /* 3. psi = ToBase(PRF^expand(rseed, [0x09] || rho)) */
+    uint8_t psi_le[32];
+    prf_in[0] = 0x09;
+    prf_expand(rseed, prf_in, sizeof(prf_in), prf_out);
+    to_base(prf_out, psi_le);
+
+    /* 4. Pack the 1086-bit Sinsemilla input */
+    uint8_t msg[136];
+    memzero(msg, sizeof(msg));
+
+    /* bits 0..255  (bytes 0..31)  : repr_P(g_d) */
+    memcpy(msg + 0, g_d_repr, 32);
+    /* bits 256..511 (bytes 32..63) : pk_d (already in repr_P form) */
+    memcpy(msg + 32, pk_d, 32);
+    /* bits 512..575 (bytes 64..71) : value, little-endian */
+    for (int i = 0; i < 8; i++) {
+        msg[64 + i] = (uint8_t)((value >> (8 * i)) & 0xFF);
+    }
+    /* bits 576..830 (bytes 72..103, top bit of byte 103 unused for rho):
+     *   first 255 bits of rho */
+    memcpy(msg + 72, rho, 31);
+    msg[103] = rho[31] & 0x7F;
+    /* bits 831..1085 : first 255 bits of psi, starting at byte 103 bit 7
+     * — equivalent to (psi & ~bit255) shifted left by 7 bits and OR'd
+     * into msg starting at byte 103. */
+    {
+        uint8_t psi_clean[32];
+        memcpy(psi_clean, psi_le, 32);
+        psi_clean[31] &= 0x7F;
+        for (int k = 0; k < 32; k++) {
+            uint8_t b = psi_clean[k];
+            msg[103 + k] |= (uint8_t)(b << 7);   /* bit 0 of b   → bit 7 of msg[103+k] */
+            msg[104 + k] |= (uint8_t)(b >> 1);   /* bits 1..7 of b → bits 0..6 of msg[104+k] */
+        }
+        memzero(psi_clean, sizeof(psi_clean));
+    }
+
+    /* 5. Sinsemilla commit + Extract_P (returns x-coordinate as bignum) */
+    bignum256 rcm_bn;
+    bn_read_le(rcm_le, &rcm_bn);
+    bignum256 cmx_bn;
+    sinsemilla_short_commit(&cmx_bn, "z.cash:Orchard-NoteCommit", msg, 1086, &rcm_bn);
+    bn_write_le(&cmx_bn, cmx_out);
+
+    /* Wipe intermediates */
+    memzero(prf_out, sizeof(prf_out));
+    memzero(prf_in, sizeof(prf_in));
+    memzero(rcm_le, sizeof(rcm_le));
+    memzero(psi_le, sizeof(psi_le));
+    memzero(msg, sizeof(msg));
+    memzero(&rcm_bn, sizeof(rcm_bn));
+    memzero(&cmx_bn, sizeof(cmx_bn));
+    memzero(&g_d, sizeof(g_d));
+    memzero(g_d_repr, sizeof(g_d_repr));
+}

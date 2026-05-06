@@ -3,6 +3,7 @@
  */
 #include "orchard_signer.h"
 #include "redpallas.h"
+#include "orchard.h"
 #include "memzero.h"
 #include <string.h>
 
@@ -177,6 +178,62 @@ OrchardSignerError orchard_signer_feed_action(OrchardSignerCtx *ctx,
         return SIGNER_ERR_BAD_STATE;
     }
 
+    if (!zip244_hash_action(&ctx->actions_state, action_data, action_len)) {
+        return SIGNER_ERR_BAD_ACTION;
+    }
+
+    ctx->actions_received++;
+    return SIGNER_OK;
+}
+
+/* Action data layout (matches zip244.c OFF_* constants):
+ *   cv_net[32] || nullifier[32] || rk[32] || cmx[32] || ephemeral_key[32] ||
+ *   enc_ciphertext[580] || out_ciphertext[80]   (total 820 bytes)
+ * The nullifier is at offset 32 (used as rho for the output note's NoteCommit
+ * per Orchard's split-action construction); cmx is at offset 96.
+ */
+#define ORCHARD_ACTION_OFFSET_NULLIFIER 32
+#define ORCHARD_ACTION_OFFSET_CMX       96
+#define ORCHARD_ACTION_TOTAL_SIZE       820
+
+OrchardSignerError orchard_signer_feed_action_with_note(
+    OrchardSignerCtx *ctx,
+    const uint8_t *action_data, size_t action_len,
+    const uint8_t recipient[43],
+    uint64_t value,
+    const uint8_t rseed[32])
+{
+    if (ctx->state != SIGNER_RECEIVING_ACTIONS) {
+        return SIGNER_ERR_BAD_STATE;
+    }
+    if (ctx->actions_received >= ctx->actions_expected) {
+        return SIGNER_ERR_BAD_STATE;
+    }
+    if (action_len != ORCHARD_ACTION_TOTAL_SIZE) {
+        return SIGNER_ERR_BAD_ACTION;
+    }
+
+    /* Recompute cmx from the claimed (d, pk_d, value, rseed) using the
+     * action's nullifier as rho, and compare it constant-time against the
+     * cmx field embedded in the action bytes. A hostile companion that
+     * substituted the recipient must produce a colliding cmx, which is
+     * computationally infeasible against Sinsemilla. */
+    const uint8_t *d         = recipient;          /* 11 bytes */
+    const uint8_t *pk_d      = recipient + 11;     /* 32 bytes */
+    const uint8_t *rho       = action_data + ORCHARD_ACTION_OFFSET_NULLIFIER;
+    const uint8_t *action_cmx = action_data + ORCHARD_ACTION_OFFSET_CMX;
+
+    uint8_t computed_cmx[32];
+    orchard_compute_cmx(d, pk_d, value, rho, rseed, computed_cmx);
+
+    if (!ct_memequal(computed_cmx, action_cmx, 32)) {
+        memzero(computed_cmx, sizeof(computed_cmx));
+        orchard_signer_reset(ctx);
+        return SIGNER_ERR_NOTE_COMMITMENT_MISMATCH;
+    }
+    memzero(computed_cmx, sizeof(computed_cmx));
+
+    /* cmx verified: feed the action through the normal hash path. */
     if (!zip244_hash_action(&ctx->actions_state, action_data, action_len)) {
         return SIGNER_ERR_BAD_ACTION;
     }

@@ -24,6 +24,13 @@
 // cv_net(32) + nullifier(32) + rk(32) + cmx(32) + ephemeral_key(32) + enc_ciphertext(580) + out_ciphertext(80)
 #define HWP_ACTION_DATA_SIZE 820
 
+// Note plaintext appended to action data for on-device cmx verification (v4):
+// recipient(43) + value(8 LE) + rseed(32) = 83 bytes
+// Required so the device can recompute the action's NoteCommitment and reject
+// recipient-substitution attacks. Total TX_OUTPUT action payload = 820 + 83 = 903.
+#define HWP_NOTE_PLAINTEXT_SIZE  83
+#define HWP_ACTION_DATA_SIZE_V4  (HWP_ACTION_DATA_SIZE + HWP_NOTE_PLAINTEXT_SIZE)
+
 // TxOutput special indices for v2 sighash verification protocol:
 // 0xFFFF = transaction metadata (header + orchard bundle info, 61 bytes)
 // 0..N-1 = action data (820 bytes each)
@@ -64,6 +71,8 @@ typedef enum {
     HWP_ERR_TRANSPARENT_DIGEST_MISMATCH = 0x0B, // Transparent digest mismatch (v3)
     HWP_ERR_SAPLING_NOT_EMPTY           = 0x0C, // sapling_digest != empty-bundle
                                                 // constant (Orchard-only invariant)
+    HWP_ERR_NOTE_COMMITMENT_MISMATCH    = 0x0D, // Recomputed cmx != action.cmx
+                                                // (recipient-substitution attempt)
 } HwpErrorCode;
 
 // FVK_REQ payload (v2.1+):
@@ -97,6 +106,23 @@ typedef struct {
     const uint8_t* output_data;
     uint16_t output_data_len;
 } HwpTxOutput;
+
+/**
+ * View of a TX_OUTPUT action payload (v4 format) split into the on-the-wire
+ * 820-byte action data and the appended 83-byte note plaintext.
+ *
+ *   wire_payload[output_data] = action[820] || recipient[43] || value[8 LE] || rseed[32]
+ *
+ * Pointers reference the original payload buffer (no copy). The device uses
+ * `recipient`/`value`/`rseed` to recompute the action's NoteCommitment and
+ * compares against `action[OFF_CMX]`. See `orchard_signer_feed_action_with_note`.
+ */
+typedef struct {
+    const uint8_t* action;       /* HWP_ACTION_DATA_SIZE = 820 bytes */
+    const uint8_t* recipient;    /* 43 bytes = d[11] || pk_d[32] */
+    uint64_t value;              /* zatoshis (host order, parsed from 8 LE bytes) */
+    const uint8_t* rseed;        /* 32 bytes */
+} HwpActionV4;
 
 typedef struct {
     uint8_t version;
@@ -161,6 +187,12 @@ uint16_t hwp_encode_sign_req(uint8_t* payload, const HwpSignReq* req);
 // Parse a TX_OUTPUT payload. Returns true on success.
 // Note: output_data points into the payload buffer (not copied).
 bool hwp_parse_tx_output(const uint8_t* payload, uint16_t len, HwpTxOutput* out);
+
+// Split a v4 action+note-plaintext output_data block (HWP_ACTION_DATA_SIZE_V4
+// = 903 bytes) into its constituents. Returns true on success, false if the
+// data length is not exactly HWP_ACTION_DATA_SIZE_V4.
+bool hwp_parse_action_v4(const uint8_t* output_data, uint16_t output_data_len,
+                         HwpActionV4* out);
 
 // TRANSPARENT_SIGN_REQ payload (v3):
 //   input_index[2 LE] || total_inputs[2 LE] ||
