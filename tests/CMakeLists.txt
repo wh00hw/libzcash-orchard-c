@@ -26,6 +26,8 @@ add_library(zcash-orchard-c-deterministic STATIC
     ${CMAKE_SOURCE_DIR}/src/rand.c
     ${CMAKE_SOURCE_DIR}/src/hash_stubs.c
     ${CMAKE_SOURCE_DIR}/src/aes/aes_ct.c
+    ${CMAKE_SOURCE_DIR}/src/aead.c
+    ${CMAKE_SOURCE_DIR}/src/wallet_lockout.c
     ${CMAKE_SOURCE_DIR}/src/hwp.c
     ${CMAKE_SOURCE_DIR}/src/zip244.c
     ${CMAKE_SOURCE_DIR}/src/orchard_signer.c
@@ -60,3 +62,7 @@ add_test(NAME test_signer COMMAND test_signer)
 add_executable(test_vectors test_vectors.c)
 target_link_libraries(test_vectors PRIVATE zcash-orchard-c-deterministic)
 add_test(NAME test_vectors COMMAND test_vectors)
+
+add_executable(test_h5 test_h5.c)
+target_link_libraries(test_h5 PRIVATE zcash-orchard-c-deterministic)
+add_test(NAME test_h5 COMMAND test_h5)
