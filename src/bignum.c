@@ -1828,12 +1828,47 @@ void bn_print_raw(const bignum256 *x) {
 }
 #endif
 
-#if USE_INVERSE_FAST
+/* Modular inverse via Fermat's little theorem: x^(-1) = x^(prime-2) mod prime
+ * when GCD(x, prime) == 1.
+ *
+ * The previous implementation (bn_inverse_fast) had constant control flow but
+ * variable memory access flow: the BN_INVERSE_FAST_TERNARY macro selects
+ * between bignum operand pointers based on secret-derived booleans, which a
+ * data-cache-aware adversary observes by measuring memory-bus contention.
+ * Inside secp256k1_ecdsa_sign_digest the inversion runs on the ECDSA nonce k,
+ * so a per-bit cache leak across many signatures recovers the long-term
+ * private key via lattice attacks (audit M-1).
+ *
+ * Fermat's exponentiation runs through bn_power_mod with exponent prime - 2,
+ * a public constant for any given curve. Every bit of the exponent goes
+ * through the same code path; only the bn_multiply inside has data-dependent
+ * timing (audit M-3, tracked separately, and not nonce-bit specific).
+ *
+ * Cost: ~256 bn_multiply calls per inversion. On ESP32-S2 this is roughly
+ * 2-3 ms — comparable to the GCD-style fast inverse, dominated by
+ * point-multiplication anyway. The constant-time properties are worth the
+ * slight overhead.
+ */
 void bn_inverse(bignum256 *x, const bignum256 *prime) {
-  bn_inverse_fast(x, prime);
+  /* Pre-reduce x to match the input contract the previous bn_inverse_fast
+   * relied on: callers (notably secp256k1 ECDSA) pass non-normalized values. */
+  bn_fast_mod(x, prime);
+  bn_mod(x, prime);
+
+  static bignum256 p_minus_2, two, result;
+  bn_zero(&two);
+  two.val[0] = 2;
+
+  bn_copy(prime, &p_minus_2);
+  bn_normalize(&p_minus_2);
+
+  /* p - 2 (assuming prime > 2 — true for every curve order we use here). */
+  bn_subtract(&p_minus_2, &two, &p_minus_2);
+
+  bn_power_mod(x, &p_minus_2, prime, &result);
+  bn_copy(&result, x);
+
+  memzero(&p_minus_2, sizeof(p_minus_2));
+  memzero(&result, sizeof(result));
+  memzero(&two, sizeof(two));
 }
-#else
-void bn_inverse(bignum256 *x, const bignum256 *prime) {
-  bn_inverse_slow(x, prime);
-}
-#endif

@@ -50,6 +50,20 @@ typedef enum {
     SIGNER_ERR_TRANSPARENT_MISMATCH,     /* Transparent digest mismatch (v3) */
     SIGNER_ERR_SAPLING_NOT_EMPTY,        /* sapling_digest != empty-bundle constant
                                             (Orchard-only invariant violation) */
+    SIGNER_ERR_TRANSPARENT_NOT_EMPTY,    /* transparent_sig_digest != empty-bundle
+                                            constant when no transparent flow was
+                                            attempted. A host that omits the
+                                            transparent stream but supplies a
+                                            non-empty digest is trying to bind
+                                            an unverified transparent bundle to
+                                            the Orchard signature. */
+    SIGNER_ERR_RECIPIENT_MISMATCH,       /* SIGN_REQ.recipient (UA) decodes to an
+                                            Orchard receiver that does not appear
+                                            among the actions the user confirmed.
+                                            A hostile companion is claiming to
+                                            send to one address while the device
+                                            is actually signing transfers to
+                                            different addresses. */
     SIGNER_ERR_NOTE_COMMITMENT_MISMATCH, /* device-recomputed cmx != action.cmx
                                             (companion-claimed recipient does not
                                             match the recipient committed in the
@@ -177,6 +191,31 @@ OrchardSignerError orchard_signer_get_action_display(
     uint16_t idx,
     uint8_t recipient_out[43],
     uint64_t *value_out);
+
+/**
+ * Constant-time check whether a 43-byte raw Orchard recipient (d || pk_d)
+ * matches at least one action's display recipient.
+ *
+ * Used by the firmware to validate a companion-supplied "intended recipient"
+ * UA against what the device is actually about to sign for. A mismatch means
+ * the host's UI is showing the user a different recipient than the device
+ * just confirmed via per-output review — the user may have been led to
+ * believe they were paying someone else.
+ *
+ * The comparison runs ct_memequal across every confirmed action in turn so
+ * that the timing reveals only "matched / didn't match", not which action
+ * matched. Returns true if any actions_display[i].recipient equals
+ * `recipient_43` byte-for-byte.
+ *
+ * If no actions have been received yet (actions_received == 0), returns
+ * false.
+ *
+ * @param ctx           Signing context
+ * @param recipient_43  43 bytes = d[11] || pk_d[32]
+ */
+bool orchard_signer_recipient_matches_any(
+    const OrchardSignerCtx *ctx,
+    const uint8_t recipient_43[43]);
 
 /**
  * Mark action `idx` as confirmed by the user.

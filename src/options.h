@@ -91,10 +91,22 @@
 #define CONFIDENTIAL
 #endif
 
-// use platform-specific hardware RNG (0 = portable LCG fallback, NOT secure)
-// Set to 1 and provide random32()/random_buffer() for your platform.
+// Platform-specific hardware RNG. Default ON for safety: every integration
+// MUST provide random32()/random_buffer() backed by a CSPRNG (audit C-2).
+//
+// If you really want the unseeded LCG fallback (e.g. for deterministic
+// unit tests), set ZORCHARD_INSECURE_LCG=1 explicitly. The library refuses
+// to compile silently against the LCG so a careless integrator can't ship
+// a build whose RedPallas nonces and BIP-39 entropy come from a
+// predictable PRNG.
 #ifndef USE_PLATFORM_RNG
-#define USE_PLATFORM_RNG 0
+#define USE_PLATFORM_RNG 1
+#endif
+
+#if !USE_PLATFORM_RNG
+#  ifndef ZORCHARD_INSECURE_LCG
+#    error "USE_PLATFORM_RNG=0 requires ZORCHARD_INSECURE_LCG=1 (DO NOT use in production)."
+#  endif
 #endif
 
 // backward compat: old Flipper flag maps to the generic one

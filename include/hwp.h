@@ -53,6 +53,11 @@ typedef enum {
     HWP_MSG_TX_TRANSPARENT_OUTPUT = 0x0C, // Transparent output for digest verification (v3)
     HWP_MSG_TRANSPARENT_SIGN_REQ  = 0x0D, // Sign transparent input (ECDSA secp256k1, v3)
     HWP_MSG_TRANSPARENT_SIGN_RSP  = 0x0E, // Transparent signature response (v3)
+    /* --- Device attestation (v4, audit M1) --- */
+    HWP_MSG_IDENTITY_REQ = 0x0F, // Request device identity pubkey (no payload)
+    HWP_MSG_IDENTITY_RSP = 0x10, // Identity response: device_pubkey[32]
+    HWP_MSG_ATTEST_REQ   = 0x11, // Attestation request: challenge[32]
+    HWP_MSG_ATTEST_RSP   = 0x12, // Attestation response: sig[64] || rk[32]
 } HwpMsgType;
 
 // --- Error codes (matches zcash-hw-signer-sdk ErrorCode) ---
@@ -206,3 +211,43 @@ bool hwp_parse_action_v4(const uint8_t* output_data, uint16_t output_data_len,
 // Encode a TX_OUTPUT payload. Returns payload size.
 uint16_t hwp_encode_tx_output(uint8_t* payload, uint16_t output_index, uint16_t total_outputs,
                               const uint8_t* output_data, uint16_t output_data_len);
+
+/* --- Device attestation (v4, audit M1) ----------------------------------
+ *
+ * Each device has a long-term Pallas identity keypair generated at first
+ * boot and persisted in NVS. The pubkey is exposed via IDENTITY_REQ and
+ * is intended to be pinned by the companion at first pairing (typically
+ * via a SEPARATE trusted CLI utility, since the everyday companion is
+ * not in the trust circle for this check).
+ *
+ * Per signing session, the companion sends a 32-byte challenge nonce.
+ * The device computes a deterministic hash of the challenge and signs
+ * it with RedPallas using the identity scalar. Because alpha = 0 in
+ * this signing path, the returned `rk` is exactly the device pubkey,
+ * so the companion can both:
+ *   1. verify rk == pinned device_pubkey (catches device substitution),
+ *   2. verify the RedPallas signature (catches replay / forgery).
+ *
+ * Threat coverage:
+ *   - USB-hub / cable MITM that swaps the device with a fake: caught by (1).
+ *   - Localhost TCP impersonator (Speculos / fake virtual device): caught by (1).
+ *   - Stolen-and-reflashed device: the identity key is regenerated on
+ *     factory reset, so the new pubkey will not match the pinned one.
+ *
+ * NOT covered:
+ *   - Hostile companion that lies about the verification result. The
+ *     standalone CLI pairing tool defends against this: a user paranoid
+ *     about their main companion runs the tool periodically and gets an
+ *     independent verdict.
+ *   - Confidentiality of FVK / sighash on the wire (channel encryption
+ *     is a separate, larger fix; not in this commit).
+ */
+#define HWP_DEVICE_PUBKEY_SIZE   32
+#define HWP_ATTEST_CHALLENGE_SIZE 32
+#define HWP_ATTEST_SIG_SIZE      64
+#define HWP_ATTEST_RSP_SIZE      (HWP_ATTEST_SIG_SIZE + HWP_DEVICE_PUBKEY_SIZE) /* 96 */
+
+/* Personalization tag for the BLAKE2b-256 of (challenge) → "sighash" passed
+ * to redpallas_sign. Domain-separates attestation signatures from any other
+ * 32-byte value the device might sign. Exactly 16 bytes (BLAKE2b personal). */
+#define HWP_ATTEST_PERSONAL "ZcashHWAttestV1!"  /* 16 bytes incl. trailing '!' */

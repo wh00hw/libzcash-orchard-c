@@ -9,7 +9,14 @@
 // Group order  q = 0x40000000000000000000000000000000224698fc0994a8dd8c46eb2100000001
 
 typedef struct {
-    bignum256 x, y, z; // Jacobian coordinates: affine = (X/Z^2, Y/Z^3)
+    /* Standard projective coordinates: affine = (X/Z, Y/Z). Z=0 represents
+     * the point at infinity, encoded canonically as (0:1:0). The legacy
+     * naming (`pallas_jac`, `pallas_to_jac`, `pallas_from_jac`) is kept for
+     * source-compatibility — these used to be Jacobian (X/Z², Y/Z³), but
+     * the implementation switched to projective in the security audit
+     * follow-up so the Renes-Costello-Batina complete addition formulas
+     * could be used (audit H-1). The struct layout is unchanged. */
+    bignum256 x, y, z;
 } pallas_jac;
 
 typedef struct {
@@ -34,6 +41,33 @@ void pallas_set_yield_cb(void (*cb)(void* ctx), void* ctx);
 typedef bool (*pallas_sinsemilla_lookup_fn)(uint32_t index, uint8_t buf_out[64], void* ctx);
 void pallas_set_sinsemilla_lookup(pallas_sinsemilla_lookup_fn fn, void* ctx);
 
+/**
+ * Verify the integrity of the loaded Sinsemilla S-table against the
+ * canonical BLAKE2b-256 fingerprint baked into the library.
+ *
+ * Walks the registered lookup callback for indices 0..1023, hashes the
+ * 64 KB of returned point data, and compares constant-time against the
+ * canonical digest. Returns true iff the loaded table matches the
+ * canonical Zcash Orchard Sinsemilla S-table.
+ *
+ * If no lookup callback is registered, the device is using the on-the-
+ * fly slow fallback (every S[i] is recomputed from a Pallas
+ * group-hash); there is no flash blob whose integrity needs checking,
+ * so the function returns true unconditionally.
+ *
+ * Every firmware (regardless of MCU or how the table is embedded —
+ * objcopy on ESP-IDF, BOLOS resource on Ledger, raw flash region on
+ * STM32) MUST call this function once at boot before invoking any
+ * Sinsemilla operation. A false return means the on-flash table was
+ * altered (supply-chain attack, fault injection during programming,
+ * NVS corruption) and Sinsemilla outputs cannot be trusted: refuse
+ * to operate. (audit M-5)
+ *
+ * Cost: 1024 callback invocations + ~64 KB of BLAKE2b. ~10 ms on a
+ * 240 MHz Cortex-class core. One-time at boot.
+ */
+bool pallas_verify_sinsemilla_table(void);
+
 // Must call before any Pallas operations
 void pallas_init(void);
 
@@ -55,6 +89,7 @@ void pallas_point_set_infinity(pallas_point* p);
 void pallas_to_jac(pallas_jac* j, const pallas_point* p);
 void pallas_from_jac(pallas_point* p, const pallas_jac* j);
 void pallas_jac_double(pallas_jac* r, const pallas_jac* p);
+void pallas_jac_add(pallas_jac* r, const pallas_jac* a, const pallas_jac* b);
 void pallas_jac_add_mixed(pallas_jac* r, const pallas_jac* p, const pallas_point* q);
 void pallas_point_mul(pallas_point* r, const bignum256* k, const pallas_point* p);
 

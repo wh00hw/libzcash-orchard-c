@@ -290,6 +290,23 @@ OrchardSignerError orchard_signer_confirm_action(
     return SIGNER_OK;
 }
 
+bool orchard_signer_recipient_matches_any(
+    const OrchardSignerCtx *ctx,
+    const uint8_t recipient_43[43])
+{
+    /* OR-accumulate the constant-time equality result across every action.
+     * We do NOT short-circuit on first match — running the full loop
+     * preserves a constant timing profile across "matched at action 0",
+     * "matched at action 4", and "did not match" — preventing a host from
+     * inferring which action was the matching one. */
+    int any_match = 0;
+    for (uint16_t i = 0; i < ctx->actions_received; i++) {
+        any_match |= (int)ct_memequal(
+            ctx->actions_display[i].recipient, recipient_43, 43);
+    }
+    return any_match != 0;
+}
+
 OrchardSignerError orchard_signer_verify(OrchardSignerCtx *ctx,
                                           const uint8_t expected_sighash[32])
 {
@@ -316,6 +333,26 @@ OrchardSignerError orchard_signer_verify(OrchardSignerCtx *ctx,
         if (!ctx->actions_display[i].confirmed) {
             return SIGNER_ERR_ACTION_NOT_CONFIRMED;
         }
+    }
+
+    /* Orchard-only-with-no-transparent invariant. The sighash mixes in
+     * tx_meta.transparent_sig_digest verbatim. If the host did NOT walk us
+     * through the transparent input/output stream (transparent_verified is
+     * false), then transparent_sig_digest must be the empty-bundle constant
+     * BLAKE2b("ZTxIdTranspaHash", ""). A host that supplies an arbitrary
+     * non-empty digest while skipping the transparent flow is trying to bind
+     * an unverified transparent bundle to the Orchard signature — see
+     * docs/security-audit/02-orchard-protocol-signing.md C2/M1.
+     * Mirrors the sapling_digest enforcement at feed_meta(). */
+    if (!ctx->transparent_verified) {
+        uint8_t transparent_empty[32];
+        zip244_empty_digest("ZTxIdTranspaHash", transparent_empty);
+        if (!ct_memequal(ctx->tx_meta.transparent_sig_digest, transparent_empty, 32)) {
+            memzero(transparent_empty, sizeof(transparent_empty));
+            orchard_signer_reset(ctx);
+            return SIGNER_ERR_TRANSPARENT_NOT_EMPTY;
+        }
+        memzero(transparent_empty, sizeof(transparent_empty));
     }
 
     /* Compute the full ZIP-244 sighash from metadata + actions */

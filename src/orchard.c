@@ -1,12 +1,13 @@
 #include "orchard.h"
 #include "pallas.h"
+#include "redpallas.h"
 #include "blake2b.h"
 #include "bignum.h"
 #include "segwit_addr.h"
 #include "memzero.h"
 #include <string.h>
 
-#include "aes/aes.h"
+#include "aes_ct.h"
 
 // Pallas base field modulus (big-endian)
 // p = 0x40000000000000000000000000000000224698fc094cf91b992d30ed00000001
@@ -24,9 +25,19 @@ static const uint8_t PALLAS_Q_BE[32] = {
     0x22, 0x46, 0x98, 0xfc, 0x09, 0x94, 0xa8, 0xdd,
     0x8c, 0x46, 0xeb, 0x21, 0x00, 0x00, 0x00, 0x01};
 
-// Reduce a 64-byte little-endian value modulo a ~255-bit prime
-// Uses bit-by-bit Horner's method: processes MSB to LSB
-// Works correctly for any prime (unlike bn_fast_mod which requires prime ~ 2^256)
+// Reduce a 64-byte little-endian value modulo a ~255-bit prime.
+// Constant-time bit-by-bit Horner's method (audit M-3): every bit triggers
+// the same operations regardless of value, and the conditional subtract is
+// performed unconditionally with bn_cmov selecting the result.
+//
+// The previous implementation had two secret-dependent branches per bit:
+//   1. `if (input_le[..] & (1 << ..)) bn_addi(&acc, 1)`  — leaks input bits
+//   2. `if (!bn_is_less(&acc, &prime)) ... bn_subtract ... bn_copy ...`
+//      — leaks structural bits of the secret-derived hash.
+// Used by to_scalar/to_base on PRF^expand outputs of sk/rivk/rseed, so the
+// timing leak applies to every key-derivation and address-derivation path.
+//
+// Works correctly for any prime (unlike bn_fast_mod which requires prime ~ 2^256).
 static void reduce_512_mod(
     const uint8_t input_le[64],
     const uint8_t modulus_be[32],
@@ -41,21 +52,23 @@ static void reduce_512_mod(
         // acc = 2 * acc
         bn_lshift(&acc);
 
-        // Add current bit
+        // Constant-time bit-add: bit_val is always added (0 or 1), no branch.
         int byte_idx = bit / 8;
         int bit_idx = bit % 8;
-        if(input_le[byte_idx] & (1 << bit_idx)) {
-            bn_addi(&acc, 1);
-        }
+        uint32_t bit_val = ((uint32_t)input_le[byte_idx] >> bit_idx) & 1u;
+        bn_addi(&acc, bit_val);
 
         // Normalize to propagate any carries from addi/lshift
         bn_normalize(&acc);
 
-        // Reduce: if acc >= prime, subtract prime
-        if(!bn_is_less(&acc, &prime)) {
-            bn_subtract(&acc, &prime, &temp);
-            bn_copy(&temp, &acc);
-        }
+        // Constant-time conditional reduce: compute (acc - prime) UNCONDITIONALLY
+        // and then bn_cmov selects whether to keep the original acc or the
+        // subtracted result based on the (constant-time) comparison.
+        // bn_subtract is well-defined when acc < prime (the result is garbage,
+        // but we discard it via bn_cmov).
+        bn_subtract(&acc, &prime, &temp);
+        int needs_reduce = !bn_is_less(&acc, &prime);
+        bn_cmov(&acc, needs_reduce, &temp, &acc);
     }
 
     bn_write_le(&acc, output_le);
@@ -243,8 +256,16 @@ static void ff1_to_be(uint64_t val, uint8_t* out, int b) {
 }
 
 void ff1_aes256_encrypt(const uint8_t key[32], const uint8_t in[11], uint8_t out[11]) {
-    aes_encrypt_ctx ctx[1];
-    aes_encrypt_key256(key, ctx);
+    /* Constant-time AES-256 (audit H-3): the previous Brian-Gladman T-table
+     * implementation leaked the round-key bytes via cache timing. The
+     * replacement scans the entire S-box on every byte substitution so
+     * the access pattern is independent of the input. FF1 runs once per
+     * account creation (then the address is cached in NVS), so the
+     * software-AES overhead is irrelevant in practice. Firmware can
+     * register a hardware-AES backend via aes_ct_256_set_override(); on
+     * ESP32-S2 / S3 the hardware AES accelerator is constant-time. */
+    aes_ct_256_ctx ctx;
+    aes_ct_256_keysched(key, &ctx);
 
     const int n = 88; // bits
     const int u = 44, v = 44;
@@ -266,7 +287,7 @@ void ff1_aes256_encrypt(const uint8_t key[32], const uint8_t in[11], uint8_t out
     // So Q = [0]*9 || [i] || [NUM_2(B) as 6 BE bytes] = 16 bytes
     // R = AES(key, AES(key, P) ^ Q)
     uint8_t prf_p[16];
-    aes_ecb_encrypt(P, prf_p, 16, ctx);
+    aes_ct_256_ecb_encrypt(&ctx, P, prf_p);
 
     for(int i = 0; i < 10; i++) {
 
@@ -279,7 +300,7 @@ void ff1_aes256_encrypt(const uint8_t key[32], const uint8_t in[11], uint8_t out
         uint8_t R[16];
         for(int j = 0; j < 16; j++) R[j] = prf_p[j] ^ Q[j];
         uint8_t S[16];
-        aes_ecb_encrypt(R, S, 16, ctx);
+        aes_ct_256_ecb_encrypt(&ctx, R, S);
 
         // y = NUM(S[0..d]) where d=12, as big-endian integer
         // We need (num_a + y) mod 2^m where m=44
@@ -301,6 +322,11 @@ void ff1_aes256_encrypt(const uint8_t key[32], const uint8_t in[11], uint8_t out
     memcpy(out, in, 11); // start with input (preserves bit layout)
     ff1_inject(out, 0, u, num_a);
     ff1_inject(out, u, v, num_b);
+
+    /* Wipe the AES round keys: rk[0]||rk[1] reconstitutes the master key,
+     * which is dk and is part of the user's spending capability. */
+    memzero(&ctx, sizeof(ctx));
+    memzero(prf_p, sizeof(prf_p));
 }
 
 // ============================================================
@@ -414,6 +440,40 @@ void f4jumble_inv(uint8_t* data, size_t len) {
     // Now d = b
 
     // Result: a || b = c || d (in-place)
+}
+
+// ============================================================
+// Identity-attestation primitive (HWP-agnostic, audit M1)
+// ============================================================
+
+int orchard_sign_with_personal(
+    const uint8_t scalar[32],
+    const uint8_t personal_16[16],
+    const uint8_t msg[32],
+    uint8_t sig_out[64],
+    uint8_t rk_out[32]) {
+    /* Stage 1: domain-separated digest of the message.
+     *
+     * BLAKE2b is used (not the orchard-specific Sinsemilla) because the
+     * verifier needs to recompute the same digest from the public
+     * (personal, msg) pair without any Pallas curve work. */
+    uint8_t digest[32];
+    blake2b_state bs;
+    blake2b_InitPersonal(&bs, 32, personal_16, 16);
+    blake2b_Update(&bs, msg, 32);
+    blake2b_Final(&bs, digest, 32);
+
+    /* Stage 2: RedPallas Schnorr-style signature with no rerandomization.
+     *
+     * `alpha = 0` ⇒ rsk = scalar (post-normalization) and rk = [scalar]·G.
+     * That binding lets the verifier check `rk == pinned_pubkey` AND
+     * verify the signature in one round-trip. */
+    static const uint8_t alpha_zero[32] = {0};
+    int ret = redpallas_sign(scalar, alpha_zero, digest, sig_out, rk_out);
+
+    memzero(digest, sizeof(digest));
+    memzero(&bs, sizeof(bs));
+    return ret;
 }
 
 // ============================================================
@@ -678,6 +738,133 @@ int orchard_encode_ua_raw(
     if (!ok) return 0;
 
     return (int)strlen(ua_out);
+}
+
+/* ---------------------------------------------------------------------- */
+/*  Unified Address decoding                                              */
+/* ---------------------------------------------------------------------- */
+/*
+ * Inverse of orchard_encode_ua_raw, used to validate companion-supplied
+ * "intended recipient" UAs against the on-device signer's actions_display[].
+ * Tracked in docs/security-audit/02-orchard-protocol-signing.md C1.
+ *
+ * ZIP-316 §3 receiver-encoding constraints relevant here:
+ *   - typecode is compactSize-encoded; for currently defined receivers
+ *     (transparent P2PKH=0x00, P2SH=0x01, Sapling=0x02, Orchard=0x03)
+ *     the typecode fits in a single byte;
+ *   - length is compactSize-encoded; for currently defined receivers
+ *     (P2PKH=20, P2SH=20, Sapling=43, Orchard=43) the length fits in a
+ *     single byte;
+ *   - the trailing 16 bytes of the F4Jumble preimage are the ASCII HRP
+ *     padded with zeros, providing a self-consistent HRP check.
+ *
+ * For forward compatibility the parser skips unknown receivers (typecode
+ * != 0x03) without rejecting them; only a malformed structure (truncated
+ * header, bad length) returns -5.
+ */
+static size_t convert_bits_5to8(
+    const uint8_t* in, size_t in_len,
+    uint8_t* out, size_t out_max)
+{
+    uint32_t val = 0;
+    int bits = 0;
+    size_t out_len = 0;
+    for (size_t i = 0; i < in_len; i++) {
+        val = (val << 5) | (in[i] & 0x1F);
+        bits += 5;
+        if (bits >= 8) {
+            bits -= 8;
+            if (out_len < out_max) out[out_len++] = (val >> bits) & 0xFF;
+        }
+    }
+    /* Trailing fewer-than-8 bits are zero-padding from the encoder; per
+     * ZIP-316 we ignore them, matching the Bitcoin segwit decode behaviour. */
+    return out_len;
+}
+
+int orchard_decode_ua_orchard_receiver(
+    const char* ua_str,
+    const char* expected_hrp,
+    uint8_t orchard_recipient_out[43])
+{
+    if (!ua_str || !expected_hrp || !orchard_recipient_out) return -1;
+
+    /* bech32m has a 90-char limit for segwit; ZIP-316 explicitly waives
+     * that so UAs can be much longer. The buffers below are `static` to
+     * keep the stack frame within the 512-byte embedded budget — the rest
+     * of the library follows the same single-threaded-use convention. */
+    static char hrp_decoded[84];
+    static uint8_t data5[512];
+    memset(hrp_decoded, 0, sizeof(hrp_decoded));
+    size_t data5_len = 0;
+
+    /* bech32_decode returns BECH32_ENCODING_BECH32M (=2), BECH32_ENCODING_BECH32
+     * (=1), or BECH32_ENCODING_NONE (=0). UAs MUST be bech32m. */
+    bech32_encoding enc = bech32_decode(hrp_decoded, data5, &data5_len, ua_str);
+    if (enc != BECH32_ENCODING_BECH32M) return -1;
+
+    /* HRP plausibility: must match the wallet's network exactly. */
+    if (strcmp(hrp_decoded, expected_hrp) != 0) return -2;
+
+    /* 5→8 bit repacking. `raw` is `static` for the same stack-budget reason
+     * as `data5`/`hrp_decoded` above. */
+    static uint8_t raw[400];
+    size_t raw_len = convert_bits_5to8(data5, data5_len, raw, sizeof(raw));
+
+    /* F4Jumble length bounds: ZIP-316 §4.2 restricts to 48..4194368 bytes;
+     * any well-formed UA on a Zcash network is comfortably within. We bound
+     * by the max receivers we anticipate (raw + 16 hrp pad). */
+    if (raw_len < 48 || raw_len > sizeof(raw)) return -3;
+
+    /* F4Jumble is its own inverse partner — apply f4jumble_inv to recover
+     * the receivers blob || padded_hrp. */
+    f4jumble_inv(raw, raw_len);
+
+    /* Verify the trailing 16-byte HRP padding matches expected_hrp. This is
+     * a self-consistent integrity check that detects truncation/corruption
+     * of the receivers section as well as an HRP swap. */
+    {
+        uint8_t hrp_pad_expected[16] = {0};
+        size_t hlen = strlen(expected_hrp);
+        if (hlen > 16) hlen = 16;
+        memcpy(hrp_pad_expected, expected_hrp, hlen);
+
+        const uint8_t* tail = raw + (raw_len - 16);
+        if (memcmp(tail, hrp_pad_expected, 16) != 0) return -2;
+    }
+
+    /* Walk receivers in the leading (raw_len - 16) bytes. We only handle
+     * single-byte compactSize typecode and length, which covers every
+     * currently defined receiver (typecodes 0..3, lengths 20 and 43). */
+    size_t receivers_len = raw_len - 16;
+    size_t i = 0;
+    int found_orchard = 0;
+
+    while (i < receivers_len) {
+        if (i + 2 > receivers_len) return -5;          /* truncated header */
+        uint8_t typecode = raw[i++];
+        uint8_t length   = raw[i++];
+
+        /* compactSize escape values are not handled — every defined
+         * receiver fits in single bytes. Reject anything that tries to
+         * use the escape, both for safety and to flag spec evolution. */
+        if (typecode == 0xFD || typecode == 0xFE || typecode == 0xFF) return -5;
+        if (length == 0xFD || length == 0xFE || length == 0xFF) return -5;
+
+        if (i + length > receivers_len) return -5;     /* truncated data */
+
+        if (typecode == 0x03 && length == 43) {
+            memcpy(orchard_recipient_out, raw + i, 43);
+            found_orchard = 1;
+            /* Don't break: completing the walk validates the structure. */
+        }
+
+        i += length;
+    }
+
+    if (i != receivers_len) return -5;                 /* trailing garbage */
+    if (!found_orchard) return -4;
+    return 0;
 }
 
 /* ---------------------------------------------------------------------- */

@@ -193,7 +193,8 @@ int redpallas_sign(
     // overflows. All statics are explicitly zeroed after use.
     static bignum256 ask_bn, alpha_bn, rsk, nonce;
     static bignum256 challenge, c_times_rsk, S_scalar;
-    static pallas_point G_spend, rk, R;
+    static bignum256 q_minus_ask, ak_y_red;       /* H-2: ask normalization */
+    static pallas_point G_spend, ak_check, rk, R; /* H-2: ak_check */
     static blake2b_state S_hash;
     static uint8_t challenge_raw[64];
     static uint8_t R_bytes[32];
@@ -205,11 +206,48 @@ int redpallas_sign(
     bn_read_le(alpha, &alpha_bn);
     fq_full_reduce(&alpha_bn);
 
-    // rsk = ask + alpha (mod q)
-    fq_add(&rsk, &ask_bn, &alpha_bn);
-
     // Get SpendAuth generator
     pallas_group_hash(&G_spend, "z.cash:Orchard", (const uint8_t*)"G", 1);
+
+    /* ===== H-2 fix: ak normalization =====================================
+     * Per Orchard spec §4.2.3 and librustzcash SpendAuthorizingKey::from(),
+     * the on-chain SpendValidatingKey ak is the encoding of [ask]·G_SpendAuth
+     * normalized to have y-bit 0. When [ask]·G has y-bit 1, the canonical
+     * encoding flips the y-coordinate, which is equivalent to using -ask as
+     * the spending scalar. redpallas_derive_ak() applies this normalization
+     * at the point level (negating ak.y) before encoding ak.
+     *
+     * Without the matching normalization here, we compute
+     *     rk = [ask + alpha]·G
+     * but the verifier reconstructs
+     *     ak_reconstructed = rk - [alpha]·G = [ask]·G  (un-normalized)
+     * which differs from the on-chain ak by a sign flip half the time. Half
+     * the seeds would silently produce signatures the network rejects.
+     *
+     * We apply the same conditional negation to ask itself, in constant time:
+     *   1. compute ak_check = [ask]·G  (one extra point_mul, ~1s on ESP32-S2)
+     *   2. test parity of ak_check.y mod p
+     *   3. cmov ask ← q - ask   when y-bit is 1
+     *
+     * The check is constant-time because q_minus_ask is computed
+     * unconditionally and bn_cmov selects in constant time. The point
+     * multiplication itself runs through pallas_point_mul, whose constant-
+     * time properties are tracked separately (audit C-1 / H-1).
+     *
+     * Audit: docs/security-audit/01-crypto-c-primitives.md H-2.
+     */
+    pallas_point_mul(&ak_check, &ask_bn, &G_spend);
+    bn_subtract(pallas_q(), &ask_bn, &q_minus_ask);
+    bn_copy(&ak_check.y, &ak_y_red);
+    bn_mod(&ak_y_red, pallas_p());
+    {
+        int needs_neg = (int)(ak_y_red.val[0] & 1);
+        bn_cmov(&ask_bn, needs_neg, &q_minus_ask, &ask_bn);
+    }
+    /* ===================================================================== */
+
+    // rsk = ask + alpha (mod q) — using the normalized ask
+    fq_add(&rsk, &ask_bn, &alpha_bn);
 
     pallas_report(10, "Computing rk...");
 
@@ -263,11 +301,14 @@ int redpallas_sign(
     memzero(&S_scalar, sizeof(S_scalar));
     memzero(&challenge, sizeof(challenge));
     memzero(&c_times_rsk, sizeof(c_times_rsk));
+    memzero(&q_minus_ask, sizeof(q_minus_ask));   /* H-2 */
+    memzero(&ak_y_red, sizeof(ak_y_red));         /* H-2 */
     memzero(challenge_raw, sizeof(challenge_raw));
     memzero(R_bytes, sizeof(R_bytes));
     memzero(rsk_bytes, sizeof(rsk_bytes));
     memzero(&S_hash, sizeof(S_hash));
     memzero(&G_spend, sizeof(G_spend));
+    memzero(&ak_check, sizeof(ak_check));         /* H-2 */
     memzero(&rk, sizeof(rk));
     memzero(&R, sizeof(R));
 

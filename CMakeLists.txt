@@ -32,10 +32,14 @@ set(CRYPTO_SOURCES
     src/sha2.c
     src/rand.c
     src/hash_stubs.c
-    src/aes/aescrypt.c
-    src/aes/aeskey.c
-    src/aes/aes_modes.c
-    src/aes/aestab.c
+    src/aes/aes_ct.c
+    # The Brian Gladman AES files (aescrypt.c, aeskey.c, aes_modes.c,
+    # aestab.c) were removed from the build in the security-audit
+    # follow-up: their T-table implementation leaks the round-key bytes
+    # via cache-timing (audit H-3), and orchard.c now routes FF1 through
+    # the constant-time aes_ct_* API. The source files are retained in
+    # src/aes/ for reference until external integrators migrate, but
+    # nothing in the library links against them.
 )
 
 set(PROTOCOL_SOURCES

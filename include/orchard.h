@@ -80,9 +80,93 @@ int orchard_encode_ua_raw(
     char* ua_out,
     size_t ua_out_len);
 
+/**
+ * Decode a Unified Address bech32m string and extract its Orchard receiver.
+ *
+ * Used by the on-device signer to compare a companion-supplied "intended
+ * recipient" UA against the recipients actually signed for, matching the
+ * defence in `orchard_signer_recipient_matches_any()`.
+ *
+ * Steps (ZIP-316 §3):
+ *   1. bech32m decode of `ua_str` (validates checksum and HRP charset);
+ *   2. 5-bit → 8-bit repacking;
+ *   3. F4Jumble inverse on the entire repacked buffer;
+ *   4. strip the trailing 16-byte HRP padding and verify it matches `expected_hrp`;
+ *   5. walk the receivers `(typecode_compact || length_compact || data)*`
+ *      and copy out the Orchard receiver (typecode == 0x03, length == 43).
+ *
+ * The function does NOT enforce typecode ascending order or duplicate-
+ * receiver checks beyond what is necessary to find the Orchard receiver,
+ * because the canonical encoding has already been signed off on by
+ * librustzcash on the host side; the device only needs to verify that
+ * SOME Orchard receiver in the UA matches the action it is about to sign.
+ *
+ * @param ua_str            UA bech32m string (NUL-terminated)
+ * @param expected_hrp      HRP the UA must use ("u" or "utest"); compared
+ *                          both against bech32m's HRP and the trailing pad
+ * @param orchard_recipient_out
+ *                          43-byte buffer for `d || pk_d` on success
+ *
+ * @return  0 on success
+ *         -1 if bech32m decode fails (bad checksum, wrong charset)
+ *         -2 if HRP mismatch (decoded HRP != expected_hrp, or pad mismatch)
+ *         -3 if F4Jumble length is out of range (UA too short or too long)
+ *         -4 if no Orchard receiver (typecode 0x03) is present in the UA
+ *         -5 if the UA structure is malformed (truncated receiver header)
+ */
+int orchard_decode_ua_orchard_receiver(
+    const char* ua_str,
+    const char* expected_hrp,
+    uint8_t orchard_recipient_out[43]);
+
 // F4Jumble encoding / decoding (ZIP-316)
 void f4jumble(uint8_t* data, size_t len);
 void f4jumble_inv(uint8_t* data, size_t len);
+
+/**
+ * Sign a 32-byte message with a Pallas identity scalar, using a 16-byte
+ * BLAKE2b personalization tag for cross-protocol domain separation.
+ *
+ * Computes:
+ *     digest = BLAKE2b-256(personal=personal_16, msg)
+ *     (sig, rk) = redpallas_sign(scalar, alpha=0, digest)
+ *
+ * Because alpha = 0:
+ *   - rsk = scalar (after the y-bit-zero ak normalization that
+ *     redpallas_sign applies internally),
+ *   - rk  = [scalar]·G_spend in canonical encoding,
+ *
+ * so the returned `rk_out` equals the device's identity pubkey (the same
+ * value `redpallas_derive_ak(scalar, &)` would produce). A verifier with
+ * a pinned copy of that pubkey can check both rk equality (no device
+ * substitution) and the RedPallas signature (no replay/forgery) against
+ * the same `digest`, which is recomputed from the public `personal_16` and
+ * `msg` values.
+ *
+ * Designed for hardware-wallet attestation flows but reusable for any
+ * "prove I have this key" challenge-response. The library is MCU-agnostic
+ * — every firmware (ESP32, STM32, Nordic, Ledger BOLOS, future targets)
+ * loads `scalar` from its own persistent storage and calls this function.
+ *
+ * The HWP attestation protocol uses the personal tag "ZcashHWAttestV1!"
+ * (defined as `HWP_ATTEST_PERSONAL` in `hwp.h`). Any other protocol that
+ * builds on top of this primitive MUST use a distinct 16-byte tag.
+ *
+ * @param scalar       32-byte Pallas identity scalar (caller's secret)
+ * @param personal_16  16-byte BLAKE2b personalization, distinct per protocol
+ * @param msg          32-byte message to be domain-separated and signed
+ * @param sig_out      64-byte RedPallas signature
+ * @param rk_out       32-byte randomized key (= canonical pubkey of `scalar`)
+ *
+ * @return 0 on success, non-zero on signing failure (unchanged from
+ *         redpallas_sign's return convention)
+ */
+int orchard_sign_with_personal(
+    const uint8_t scalar[32],
+    const uint8_t personal_16[16],
+    const uint8_t msg[32],
+    uint8_t sig_out[64],
+    uint8_t rk_out[32]);
 
 // FF1-AES-256 encrypt 11 bytes (for diversifier derivation)
 void ff1_aes256_encrypt(const uint8_t key[32], const uint8_t in[11], uint8_t out[11]);

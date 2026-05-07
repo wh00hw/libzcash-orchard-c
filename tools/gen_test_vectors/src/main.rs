@@ -407,11 +407,21 @@ fn generate_redpallas_vectors(out: &mut String) {
 
     // rsk = ask + alpha mod q
     let ask_scalar = pallas::Scalar::from_repr(ask).unwrap();
+
+    // ===== H-2: ak normalization (mirror of redpallas_sign / librustzcash) =====
+    // If [ask]·G has y-bit 1, replace ask with -ask so the on-chain ak has
+    // y-bit 0 (canonical encoding). Without this, ~50% of seeds produce
+    // signatures librustzcash rejects.
+    let g_spend = pallas::Point::hash_to_curve("z.cash:Orchard")(b"G");
+    let ak_check = g_spend * ask_scalar;
+    let ak_bytes = point_to_le_bytes(&ak_check);
+    let ask_scalar = if (ak_bytes[31] >> 7) & 1 == 1 { -ask_scalar } else { ask_scalar };
+    // ============================================================================
+
     let alpha_scalar = pallas::Scalar::from_repr(alpha).unwrap();
     let rsk = ask_scalar + alpha_scalar;
 
     // rk = [rsk] * G_SpendAuth
-    let g_spend = pallas::Point::hash_to_curve("z.cash:Orchard")(b"G");
     let rk = g_spend * rsk;
     let rk_bytes = point_to_le_bytes(&rk);
 
@@ -803,12 +813,28 @@ fn generate_redpallas_extra_vectors(out: &mut String) {
     let g_spend = pallas::Point::hash_to_curve("z.cash:Orchard")(b"G");
     let fixed_random = [0x42u8; 32];
 
-    // Helper: compute full signing with given ask, alpha, sighash
+    // Helper: compute full signing with given ask, alpha, sighash.
+    //
+    // Mirrors the device's redpallas_sign() including the H-2 ak normalization:
+    // if [ask]·G has y-bit 1, replace ask with -ask before computing rsk so
+    // the on-chain ak (canonical encoding with y-bit 0) verifies against rk.
+    // Without this step, ~50% of seeds produce signatures that librustzcash
+    // rejects, even though both sides are self-consistent.
     fn sign_deterministic(
         ask: &[u8; 32], alpha: &[u8; 32], sighash: &[u8; 32],
         g_spend: &pallas::Point, fixed_random: &[u8; 32],
     ) -> ([u8; 32], [u8; 64]) {
         let ask_s = pallas::Scalar::from_repr(*ask).unwrap();
+
+        // ===== H-2: ak normalization =====================================
+        // Pallas compressed encoding sets the high bit of byte 31 when y is
+        // odd. We test that bit and conditionally negate ask, matching
+        // librustzcash::orchard::SpendAuthorizingKey::from(SpendingKey).
+        let ak_check = *g_spend * ask_s;
+        let ak_bytes = point_to_le_bytes(&ak_check);
+        let ask_s = if (ak_bytes[31] >> 7) & 1 == 1 { -ask_s } else { ask_s };
+        // ===================================================================
+
         let alpha_s = pallas::Scalar::from_repr(*alpha).unwrap();
         let rsk = ask_s + alpha_s;
         let rk = *g_spend * rsk;
