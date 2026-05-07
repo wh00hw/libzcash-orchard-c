@@ -1085,6 +1085,13 @@ static void bn_inverse_fast(bignum256 *x, const bignum256 *prime) {
 // Assumes prime is odd, normalized, 2**256 - 2**224 <= prime <= 2**256
 // The function has constant control flow but not constant memory access flow
 //   with regard to prime and x
+//
+// audit M-1: kept in tree as historical reference; the public bn_inverse
+// switched to Fermat-via-bn_power_mod in commit 2c046db. This function
+// is no longer called anywhere; the `unused` attribute prevents -Werror
+// builds (e.g. Flipper Zero / ufbt) from rejecting the file. Linker
+// will drop the dead symbol.
+__attribute__((unused))
 static void bn_inverse_fast(bignum256* x, const bignum256* prime) {
     // Custom constant time version of "The Almost Montgomery Inverse" from the
     // section 3 of "Constant Time Modular Inversion" by Joppe W. Bos
