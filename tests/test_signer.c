@@ -390,6 +390,183 @@ static void test_sign_refuses_without_verify(void) {
     printf("  PASS: sign refuses (NOT_VERIFIED) if state never reached VERIFIED\n");
 }
 
+/* ----------------------------------------------------------------------- */
+/*  Transparent-output capture (no-blind-signing for t-addr destinations)  */
+/* ----------------------------------------------------------------------- */
+
+/* Build the wire payload of one TxTransparentOutput:
+ *   value[8 LE] || script_pubkey_len[2 LE] || script_pubkey[N]
+ * Returns the total length written. */
+static size_t build_transparent_output_wire(
+    uint8_t *out, uint64_t value,
+    const uint8_t *script, uint16_t script_len) {
+    for (int i = 0; i < 8; i++) out[i] = (uint8_t)(value >> (8 * i));
+    out[8] = (uint8_t)(script_len & 0xFF);
+    out[9] = (uint8_t)(script_len >> 8);
+    memcpy(out + 10, script, script_len);
+    return 10 + script_len;
+}
+
+/* Build a standard P2PKH script_pubkey:
+ *   OP_DUP OP_HASH160 0x14 <pkh:20> OP_EQUALVERIFY OP_CHECKSIG (25 B) */
+static void build_p2pkh_script(uint8_t out[25], const uint8_t pkh[20]) {
+    out[0] = 0x76; out[1] = 0xa9; out[2] = 0x14;
+    memcpy(out + 3, pkh, 20);
+    out[23] = 0x88; out[24] = 0xac;
+}
+
+static void test_transparent_output_capture_p2pkh(void) {
+    /* feed_transparent_output() must store (value, script_pubkey) in the
+     * display array so the firmware UI can render the destination
+     * t-address — without this, a shielded → t-addr sweep would show
+     * the user only the change Orchard receivers, not the actual
+     * transparent recipient. */
+    OrchardSignerCtx ctx;
+    uint8_t wire[125];
+    start_session_for_one_action(&ctx, wire);
+    assert(orchard_signer_begin_transparent(&ctx, /*in*/0, /*out*/1) == SIGNER_OK);
+    assert(ctx.state == SIGNER_RECEIVING_TRANSPARENT);
+
+    uint8_t pkh[20];
+    for (int i = 0; i < 20; i++) pkh[i] = (uint8_t)(0x10 + i);
+    uint8_t script[25];
+    build_p2pkh_script(script, pkh);
+    uint64_t value = 696969;
+
+    uint8_t out_wire[64];
+    size_t out_wire_len =
+        build_transparent_output_wire(out_wire, value, script, sizeof(script));
+    assert(orchard_signer_feed_transparent_output(&ctx, out_wire, out_wire_len)
+           == SIGNER_OK);
+    assert(ctx.transparent_state.outputs_received == 1);
+
+    uint64_t got_value = 0;
+    uint8_t got_script[25];
+    size_t got_script_len = 0;
+    OrchardSignerError gerr = orchard_signer_get_transparent_output_display(
+        &ctx, 0, &got_value, got_script, sizeof(got_script), &got_script_len);
+    assert(gerr == SIGNER_OK);
+    assert(got_value == value);
+    assert(got_script_len == sizeof(script));
+    assert(memcmp(got_script, script, sizeof(script)) == 0);
+    printf("  PASS: P2PKH transparent output captured (value + script roundtrip)\n");
+}
+
+static void test_transparent_output_oversized_script_rejected(void) {
+    /* script_pubkey > 25 B is rejected at feed time so the device cannot
+     * be coaxed into signing a transaction it cannot display: any
+     * non-standard shape would have to be displayed as raw script
+     * (which the no-blind-signing invariant refuses to do). */
+    OrchardSignerCtx ctx;
+    uint8_t wire[125];
+    start_session_for_one_action(&ctx, wire);
+    assert(orchard_signer_begin_transparent(&ctx, 0, 1) == SIGNER_OK);
+
+    uint8_t huge[80] = {0};
+    uint8_t out_wire[128];
+    size_t out_wire_len =
+        build_transparent_output_wire(out_wire, 1, huge, sizeof(huge));
+    OrchardSignerError err =
+        orchard_signer_feed_transparent_output(&ctx, out_wire, out_wire_len);
+    assert(err == SIGNER_ERR_TRANSPARENT_BAD_OUTPUT);
+    /* Context resets so the partial session is discarded. */
+    assert(ctx.state == SIGNER_IDLE);
+    printf("  PASS: oversized script rejected, ctx reset\n");
+}
+
+static void test_transparent_output_too_many_rejected(void) {
+    /* Feeding more transparent outputs than the bounded display array
+     * holds (ORCHARD_SIGNER_MAX_T_OUTPUTS) is refused with
+     * TOO_MANY_ACTIONS. The invariant is the same as for Orchard
+     * actions: every output the device signs must be displayable. */
+    OrchardSignerCtx ctx;
+    uint8_t wire[125];
+    start_session_for_one_action(&ctx, wire);
+    assert(orchard_signer_begin_transparent(
+               &ctx, 0, ORCHARD_SIGNER_MAX_T_OUTPUTS + 1) == SIGNER_OK);
+
+    uint8_t pkh[20] = {0};
+    uint8_t script[25];
+    build_p2pkh_script(script, pkh);
+    uint8_t out_wire[64];
+    size_t out_wire_len =
+        build_transparent_output_wire(out_wire, 1, script, sizeof(script));
+
+    /* Fill the array. */
+    for (int i = 0; i < ORCHARD_SIGNER_MAX_T_OUTPUTS; i++) {
+        assert(orchard_signer_feed_transparent_output(
+                   &ctx, out_wire, out_wire_len) == SIGNER_OK);
+    }
+    /* MAX_T_OUTPUTS + 1 → rejection. */
+    OrchardSignerError err =
+        orchard_signer_feed_transparent_output(&ctx, out_wire, out_wire_len);
+    assert(err == SIGNER_ERR_TOO_MANY_ACTIONS);
+    assert(ctx.state == SIGNER_IDLE);
+    printf("  PASS: > %d transparent outputs rejected\n",
+           ORCHARD_SIGNER_MAX_T_OUTPUTS);
+}
+
+static void test_transparent_get_display_out_of_range(void) {
+    OrchardSignerCtx ctx;
+    uint8_t wire[125];
+    start_session_for_one_action(&ctx, wire);
+    assert(orchard_signer_begin_transparent(&ctx, 0, 1) == SIGNER_OK);
+
+    /* No outputs received yet → idx=0 out of range. */
+    uint64_t v;
+    uint8_t s[25];
+    size_t slen;
+    OrchardSignerError err = orchard_signer_get_transparent_output_display(
+        &ctx, 0, &v, s, sizeof(s), &slen);
+    assert(err == SIGNER_ERR_INVALID_ACTION_INDEX);
+    printf("  PASS: get_transparent_output_display rejects out-of-range\n");
+}
+
+/* ----------------------------------------------------------------------- */
+/*  Recipient-binding (orchard_signer_recipient_matches_any)               */
+/* ----------------------------------------------------------------------- */
+
+static void test_recipient_matches_any_after_feed(void) {
+    /* After feed_action_with_note succeeds, the captured recipient
+     * must be discoverable via recipient_matches_any — the constant-
+     * time matcher the dispatcher uses to bind SIGN_REQ.recipient to a
+     * user-confirmed Orchard receiver, closing the post-confirmation
+     * recipient-substitution attack. */
+    OrchardSignerCtx ctx;
+    uint8_t wire[125];
+    start_session_for_one_action(&ctx, wire);
+
+    uint8_t action[820];
+    build_synthetic_action(action, note_commit_rho, note_commit_expected_cmx);
+    assert(orchard_signer_feed_action_with_note(
+               &ctx, action, sizeof(action),
+               note_commit_recipient, note_commit_value, note_commit_rseed)
+           == SIGNER_OK);
+
+    /* Exact match wins. */
+    assert(orchard_signer_recipient_matches_any(&ctx, note_commit_recipient)
+           == true);
+
+    /* Off-by-one-bit attacker recipient does not. */
+    uint8_t attacker[43];
+    memcpy(attacker, note_commit_recipient, 43);
+    attacker[0] ^= 0x01;
+    assert(orchard_signer_recipient_matches_any(&ctx, attacker) == false);
+    printf("  PASS: recipient_matches_any matches captured / rejects tampered\n");
+}
+
+static void test_recipient_matches_any_empty(void) {
+    /* With no actions received the matcher must return false rather
+     * than e.g. degenerate-match against zero-initialised storage. */
+    OrchardSignerCtx ctx;
+    uint8_t wire[125];
+    start_session_for_one_action(&ctx, wire);
+
+    uint8_t zeros[43] = {0};
+    assert(orchard_signer_recipient_matches_any(&ctx, zeros) == false);
+    printf("  PASS: recipient_matches_any returns false on empty session\n");
+}
+
 int main(void) {
     printf("Orchard signer / Sapling-empty-bundle invariant tests:\n");
     test_sapling_empty_accepted();
@@ -410,6 +587,17 @@ int main(void) {
     test_invalid_action_index();
     test_too_many_actions_rejected_at_meta();
     test_sign_refuses_without_verify();
+
+    printf("\nOrchard signer / transparent-output display tests:\n");
+    test_transparent_output_capture_p2pkh();
+    test_transparent_output_oversized_script_rejected();
+    test_transparent_output_too_many_rejected();
+    test_transparent_get_display_out_of_range();
+
+    printf("\nOrchard signer / recipient-binding tests:\n");
+    test_recipient_matches_any_after_feed();
+    test_recipient_matches_any_empty();
+
     printf("All signer tests passed.\n");
     return 0;
 }

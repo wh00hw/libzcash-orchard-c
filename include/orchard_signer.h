@@ -28,6 +28,15 @@
  */
 #define ORCHARD_SIGNER_MAX_ACTIONS 16
 
+/**
+ * Maximum number of transparent outputs the signer will capture for
+ * per-output display. Bounded so the captured script + value array
+ * costs at most MAX_T_OUTPUTS * 34 ≈ 272 bytes of RAM. Eight is
+ * generous for any realistic Zcash transaction (a typical shielded →
+ * t-addr sweep produces exactly one transparent output).
+ */
+#define ORCHARD_SIGNER_MAX_T_OUTPUTS 8
+
 typedef enum {
     SIGNER_IDLE,                     /* Waiting for metadata */
     SIGNER_RECEIVING_TRANSPARENT,    /* Collecting transparent inputs/outputs (v3) */
@@ -89,6 +98,22 @@ typedef struct {
     bool confirmed;          /* set by orchard_signer_confirm_action() */
 } OrchardActionDisplay;
 
+/**
+ * Per-transparent-output display info captured from
+ * orchard_signer_feed_transparent_output(). The firmware reads these
+ * via orchard_signer_get_transparent_output_display() and renders the
+ * destination t-address (decoded from script_pubkey via base58.h) on
+ * its trusted screen so the user sees where transparent funds are
+ * actually going — without this, shielded → t-addr sweeps would sign
+ * with the user only seeing the change Orchard outputs (which point
+ * back to their own wallet), masking the real recipient.
+ */
+typedef struct {
+    uint8_t script[25];      /* Standard P2PKH = 25 B; P2SH = 23 B */
+    uint8_t script_len;
+    uint64_t value;          /* output value in zatoshis */
+} TransparentOutputDisplay;
+
 typedef struct {
     OrchardSignerState state;
     Zip244TxMeta tx_meta;
@@ -108,6 +133,14 @@ typedef struct {
      *  orchard_signer_verify() refuses to transition to VERIFIED unless every
      *  entry [0 .. actions_expected) has confirmed == true. */
     OrchardActionDisplay actions_display[ORCHARD_SIGNER_MAX_ACTIONS];
+    /** Per-transparent-output captured by feed_transparent_output(),
+     *  consumed by the firmware UI via
+     *  get_transparent_output_display(). Bounded; if a transaction
+     *  has more transparent outputs than fit here, the OVERFLOW ones
+     *  are still hashed into the digest (so the signature commits to
+     *  them) but cannot be displayed — feed_transparent_output()
+     *  returns SIGNER_ERR_TOO_MANY_ACTIONS to surface the limit. */
+    TransparentOutputDisplay t_outputs_display[ORCHARD_SIGNER_MAX_T_OUTPUTS];
 } OrchardSignerCtx;
 
 /**
@@ -260,9 +293,42 @@ OrchardSignerError orchard_signer_feed_transparent_input(OrchardSignerCtx *ctx,
 /**
  * Feed one transparent output's data (v3).
  * Must be in RECEIVING_TRANSPARENT state.
+ *
+ * Also parses (value, script_pubkey) out of the input bytes and
+ * captures them for the per-output display loop, bounded by
+ * ORCHARD_SIGNER_MAX_T_OUTPUTS. A transaction with more transparent
+ * outputs than that is rejected with SIGNER_ERR_TOO_MANY_ACTIONS to
+ * preserve the no-blind-signing invariant (every output the user
+ * signs must be displayable on the trusted screen).
+ *
+ * Wire format (matches HwpDispatcher / signer.rs serialise):
+ *   value[8 LE] || script_pubkey_len[2 LE] || script_pubkey[N]
  */
 OrchardSignerError orchard_signer_feed_transparent_output(OrchardSignerCtx *ctx,
                                                            const uint8_t *data, size_t data_len);
+
+/**
+ * Read out the (value, script_pubkey) captured for transparent output
+ * `idx`. Use base58.h::script_to_taddr() to render the destination
+ * t-address from the returned script_pubkey.
+ *
+ * @param ctx              Signing context
+ * @param idx              Output index, 0 .. transparent_state.outputs_received - 1
+ * @param value_out        Output value in zatoshis
+ * @param script_out       Caller-provided buffer ≥ 25 bytes
+ * @param script_out_cap   Capacity of script_out
+ * @param script_len_out   Actual script length written
+ *
+ * @return SIGNER_OK, or SIGNER_ERR_INVALID_ACTION_INDEX (out of range),
+ *         or SIGNER_ERR_BAD_STATE (capture buffer too small for this entry).
+ */
+OrchardSignerError orchard_signer_get_transparent_output_display(
+    const OrchardSignerCtx *ctx,
+    uint16_t idx,
+    uint64_t *value_out,
+    uint8_t *script_out,
+    size_t script_out_cap,
+    size_t *script_len_out);
 
 /**
  * Verify the transparent digest against TxMeta's transparent_sig_digest (v3).

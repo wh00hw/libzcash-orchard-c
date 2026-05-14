@@ -79,4 +79,14 @@ void pbkdf2_hmac_sha512(
     uint8_t* key,
     int keylen);
 
+/**
+ * Optional progress callback for the long-running KDF loop. Called every
+ * ~512 iterations of pbkdf2_hmac_sha512_Update with `percent` in [0, 100]
+ * and a static label string. Same signature shape as pallas's progress cb,
+ * so a firmware can route both through one renderer. Pass cb=NULL to
+ * deregister.
+ */
+typedef void (*pbkdf2_progress_cb)(uint8_t percent, const char* label, void* ctx);
+void pbkdf2_set_progress_cb(pbkdf2_progress_cb cb, void* ctx);
+
 #endif

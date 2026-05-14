@@ -48,6 +48,8 @@ set(PROTOCOL_SOURCES
     src/hwp.c
     src/zip244.c
     src/orchard_signer.c
+    src/hwp_dispatcher.c
+    src/base58.c
 )
 
 # --- Static library ---

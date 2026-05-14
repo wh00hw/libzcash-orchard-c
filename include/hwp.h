@@ -78,6 +78,8 @@ typedef enum {
                                                 // constant (Orchard-only invariant)
     HWP_ERR_NOTE_COMMITMENT_MISMATCH    = 0x0D, // Recomputed cmx != action.cmx
                                                 // (recipient-substitution attempt)
+    HWP_ERR_RECIPIENT_MISMATCH          = 0x0E, // SIGN_REQ.recipient (UA) does
+                                                // not match any confirmed action
 } HwpErrorCode;
 
 // FVK_REQ payload (v2.1+):

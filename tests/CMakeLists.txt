@@ -31,6 +31,8 @@ add_library(zcash-orchard-c-deterministic STATIC
     ${CMAKE_SOURCE_DIR}/src/hwp.c
     ${CMAKE_SOURCE_DIR}/src/zip244.c
     ${CMAKE_SOURCE_DIR}/src/orchard_signer.c
+    ${CMAKE_SOURCE_DIR}/src/base58.c
+    ${CMAKE_SOURCE_DIR}/src/hwp_dispatcher.c
 )
 target_include_directories(zcash-orchard-c-deterministic
     PUBLIC ${CMAKE_SOURCE_DIR}/include
@@ -66,3 +68,11 @@ add_test(NAME test_vectors COMMAND test_vectors)
 add_executable(test_h5 test_h5.c)
 target_link_libraries(test_h5 PRIVATE zcash-orchard-c-deterministic)
 add_test(NAME test_h5 COMMAND test_h5)
+
+add_executable(test_base58 test_base58.c)
+target_link_libraries(test_base58 PRIVATE zcash-orchard-c-deterministic)
+add_test(NAME test_base58 COMMAND test_base58)
+
+add_executable(test_hwp_dispatcher test_hwp_dispatcher.c)
+target_link_libraries(test_hwp_dispatcher PRIVATE zcash-orchard-c-deterministic)
+add_test(NAME test_hwp_dispatcher COMMAND test_hwp_dispatcher)

@@ -20,8 +20,10 @@ Implements key derivation, address generation, RedPallas signing, ECDSA transpar
 - **Per-action user confirmation invariant** — `orchard_signer_verify()` refuses to advance to `SIGNER_VERIFIED` unless every captured action has been explicitly confirmed via `orchard_signer_confirm_action()`. Combined with the existing `sign()` precondition (`state == VERIFIED`), this enforces "no blind signing" at library level: a hostile firmware that skips the per-output user-confirmation UI cannot extract a signature
 - **Unified Address encoding from arbitrary recipients** — `orchard_encode_ua_raw(d, pk_d, hrp)` produces the canonical ZIP-316 Bech32m string for an Orchard payment address that is *not* the device's own — needed to render the recipient of every output to the user before they confirm
 - **Signing context** (`orchard_signer.h`) — library-level state machine that composes all of the above: a signature is only producible after sapling-empty + per-action cmx + per-action user confirmation + sighash match all pass
-- **Hardware Wallet Protocol v2/v3** — framed binary serial protocol with CRC-16, incremental sighash verification, transparent digest verification, transparent ECDSA signing, compatible with [zcash-hw-wallet-sdk](https://github.com/wh00hw/zcash-hw-wallet-sdk) (Rust)
-- **BIP39 mnemonic** — generation and seed derivation (PBKDF2-HMAC-SHA512)
+- **Hardware Wallet Protocol v2/v3/v4** — framed binary serial protocol with CRC-16, incremental sighash verification, transparent digest verification, transparent ECDSA signing, compatible with [zcash-hw-wallet-sdk](https://github.com/wh00hw/zcash-hw-wallet-sdk) (Rust)
+- **Target-agnostic protocol dispatcher** (`hwp_dispatcher.h`) — the entire device-side state machine (drain → parse → switch → reply, PING/PONG keepalive, IDLE detection, multi-frame drain handling, per-output review orchestration, recipient binding) is contained in the library and exposed through a callback-based API. A new device target wires up six I/O callbacks (`serial_drain`, `serial_send`, `get_tick_ms`, `sleep_ms`, `should_exit`, plus UI callbacks for review/confirm) and gets the full protocol implementation for free. The same code runs on FlipZcash, the virtual-device test fixture, and future ESP32 / BOLOS ports — fix once, benefit everywhere.
+- **Transparent t-address rendering on-device** (`base58.h`) — `script_to_taddr()` decodes a P2PKH or P2SH `script_pubkey` to the corresponding Zcash t-address string (mainnet `t1`/`t3`, testnet `tm`/`t2`) via Base58Check encoding. Lets the device display the actual destination of a transparent output (e.g. on a shielded → t-addr sweep) instead of only the change Orchard receivers, extending the no-blind-signing invariant to transparent recipients.
+- **BIP39 mnemonic** — generation and seed derivation (PBKDF2-HMAC-SHA512) with an optional progress callback (`pbkdf2_set_progress_cb`) so the UI can drive a bar during multi-second PIN-derived KDF.
 - **Crypto primitives** — BLAKE2b, SHA-256/512, HMAC, PBKDF2, AES-256 (FF1), all in pure C
 - **Platform-agnostic** — pluggable RNG, optional Sinsemilla table acceleration, portable compiler abstractions
 
@@ -256,9 +258,11 @@ include/
   secp256k1.h      — secp256k1 curve + ECDSA signing + RFC 6979 (Transparent)
   bip32.h          — BIP-32 transparent HD key derivation (HMAC-SHA512)
   pallas.h         — Pallas curve arithmetic, Sinsemilla hash
-  hwp.h            — Hardware Wallet Protocol v2/v3 (serial framing)
+  hwp.h            — Hardware Wallet Protocol v2/v3/v4 (serial framing)
+  hwp_dispatcher.h — Device-side protocol driver (callback-based, target-agnostic)
   zip244.h         — ZIP-244 v5 sighash (shielded + transparent per-input)
   orchard_signer.h — Signing context with mandatory sighash verification
+  base58.h         — Base58Check + transparent script_pubkey → t-address rendering
   bip39.h          — BIP39 mnemonic generation
   bignum.h         — 256-bit big number arithmetic
   blake2b.h        — BLAKE2b hash
@@ -378,6 +382,77 @@ orchard_signer_sign(&ctx, sighash, ask, alpha, sig, rk);
 | Per-action recipient (UA) + value | streamed note plaintext | ✅ shown to user; sign refuses unless every output explicitly confirmed |
 
 No part of the sighash, the per-action note commitment, or the per-output recipient/value is taken on faith from the companion app.
+
+## Device-side dispatcher (`hwp_dispatcher.h`)
+
+The protocol code that drives the device side of an HWP session — drain CDC bytes, parse frames, dispatch by message type, reply with ACK/SignRsp/Error, keepalive, IDLE detection — is the same on every target. Reimplementing it once per device firmware (FlipZcash, zcash-esp32, future BOLOS) duplicates bugs and protocol drift. `hwp_dispatcher.h` factors that machinery into the library and exposes it as a single entry point driven by callbacks.
+
+### API shape
+
+```c
+#include "hwp_dispatcher.h"
+
+OrchardSignerCtx signer;
+orchard_signer_init(&signer);
+
+HwpDispatcher d = {
+    .io = {
+        .serial_drain  = my_cdc_drain,     /* pull up to N bytes, non-blocking */
+        .serial_send   = my_cdc_send,      /* block until queued/sent          */
+        .get_tick_ms   = my_tick,
+        .sleep_ms      = my_sleep,
+        .should_exit   = my_should_exit,
+    },
+    .ui = {
+        .review_output = my_review_screen, /* per-output recipient + value     */
+        .confirm_tx    = my_confirm_tx,    /* final amount/fee/recipient OK    */
+        .network_error = my_net_err,
+        .phase_update  = my_phase_cb,      /* persistent status footer         */
+        .progress      = my_progress_cb,   /* mid-crypto % + label             */
+    },
+    .keys = { .ak = ak, .nk = nk, .rivk = rivk,
+               .ask = ask, .t_sk = t_sk, .t_pubkey = t_pubkey },
+    .signer    = &signer,
+    .testnet   = is_testnet,
+    .user_ctx  = my_app_context,
+};
+
+hwp_dispatcher_run(&d);   /* returns when should_exit() flips true */
+```
+
+The application supplies only target-specific glue:
+
+| Concern | Owner |
+|---|---|
+| HWP framing, encode/decode | library (`hwp.h`) |
+| Crypto, key derivation, signing | library (`redpallas.h`, `secp256k1.h`, `orchard_signer.h`) |
+| ZIP-244 sighash recomputation | library (`zip244.h`, `orchard_signer.h`) |
+| State machine + message dispatch | library (`hwp_dispatcher.h`) |
+| PING/PONG keepalive, IDLE detection, drain back-pressure | library (`hwp_dispatcher.h`) |
+| Per-output review + final confirm orchestration | library (`hwp_dispatcher.h`) |
+| Recipient binding (UA / t-addr) | library (`hwp_dispatcher.h` + `base58.h` + `orchard.h`) |
+| **USB CDC / UART primitives** | application |
+| **Screen rendering + button input** | application |
+| **Sealed-storage key load** | application |
+
+A device firmware shrinks to ~50 lines of platform glue plus its UI scenes.
+
+### Per-output review covers both classes of recipient
+
+The dispatcher's review loop iterates **both** transparent outputs (rendered as base58check t-addresses via `script_to_taddr`) and Orchard actions (rendered as Bech32m UAs via `orchard_encode_ua_raw`), in that order. Without this, a shielded → t-addr sweep would have the user confirm only the change Orchard receivers (which point back to their own wallet) while the actual destination — the transparent output — would never appear on the trusted screen.
+
+For transparent outputs, the device captures `(value, script_pubkey)` for each output as it streams in (`feed_transparent_output()` adds the entry to `OrchardSignerCtx.t_outputs_display[]`, bounded by `ORCHARD_SIGNER_MAX_T_OUTPUTS = 8`; non-standard or oversized scripts are rejected at this point, preserving the invariant that every output the device signs is renderable on-screen).
+
+### Protocol-layer fixes baked in
+
+A handful of protocol bugs that were discovered in application-level re-implementations of the dispatcher are now fixed once, in the library:
+
+- **IDLE-only IDLE_RESET** — multi-second Sinsemilla cmx recomputation can keep the worker out of the dispatch loop for >>1.5 s. Firing IDLE_RESET in that window flipped the device to `!connected`, restarting the 400 ms periodic PING. The host PONGed every one of them, queueing hundreds of PONGs in the CDC RX buffer, and the parser drain dropped the next legitimate frame (the host's subsequent action data). The dispatcher now skips IDLE_RESET while `signer.state != SIGNER_IDLE`.
+- **Bounded carryover for multi-frame drains** — the parser callback used to early-return after `FRAME_READY`, silently dropping every byte that came in the same CDC chunk as the frame's tail. The dispatcher now stashes those bytes in a per-iteration carryover buffer (bounded by one CDC packet, 64 B) and replays them on the next loop iteration before pulling more from CDC.
+- **Transparent-output-only bootstrap** — if the host sends a pure transparent-output stream (shielded → t-addr sweep, zero transparent inputs), `orchard_signer_begin_transparent()` is now invoked from the output handler with `num_inputs=0`; previously the state machine remained in `RECEIVING_ACTIONS` and rejected the first output.
+- **t-address network detection** — the SIGN_REQ recipient check now recognises every Zcash transparent-address prefix (`t1` / `t3` mainnet, `tm` / `t2` testnet) in addition to the shielded UA prefixes (`u` / `utest`). Previously a transparent recipient triggered a false `NETWORK_MISMATCH` error.
+
+These fixes apply to every device target that calls `hwp_dispatcher_run()`.
 
 ## Known limitations
 

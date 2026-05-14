@@ -27,6 +27,17 @@
 #include "memzero.h"
 #include "sha2.h"
 
+/* ------------------------------------------------------------------ */
+/*  Optional progress callback (matches pallas_set_progress_cb shape)  */
+/* ------------------------------------------------------------------ */
+static pbkdf2_progress_cb s_pbkdf2_progress = NULL;
+static void* s_pbkdf2_progress_ctx = NULL;
+
+void pbkdf2_set_progress_cb(pbkdf2_progress_cb cb, void* ctx) {
+    s_pbkdf2_progress = cb;
+    s_pbkdf2_progress_ctx = ctx;
+}
+
 void pbkdf2_hmac_sha256_Init(
     PBKDF2_HMAC_SHA256_CTX* pctx,
     const uint8_t* pass,
@@ -144,12 +155,23 @@ void pbkdf2_hmac_sha512_Init(
 }
 
 void pbkdf2_hmac_sha512_Update(PBKDF2_HMAC_SHA512_CTX* pctx, uint32_t iterations) {
+    /* Throttle the callback to once every 512 iterations — calling it on
+     * every step would dominate the workload. 512 ≈ 1% granularity at the
+     * 50 000-iter setting we ship, which is plenty for a UI bar. */
+    const uint32_t step = 512;
     for(uint32_t i = pctx->first; i < iterations; i++) {
         sha512_Transform(pctx->idig, pctx->g, pctx->g);
         sha512_Transform(pctx->odig, pctx->g, pctx->g);
         for(uint32_t j = 0; j < SHA512_DIGEST_LENGTH / sizeof(uint64_t); j++) {
             pctx->f[j] ^= pctx->g[j];
         }
+        if(s_pbkdf2_progress && (i % step) == 0) {
+            uint8_t pct = (uint8_t)((uint64_t)i * 100u / iterations);
+            s_pbkdf2_progress(pct, "Deriving key", s_pbkdf2_progress_ctx);
+        }
+    }
+    if(s_pbkdf2_progress) {
+        s_pbkdf2_progress(100, "Deriving key", s_pbkdf2_progress_ctx);
     }
     pctx->first = 0;
 }

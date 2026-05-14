@@ -919,11 +919,21 @@ void sinsemilla_hash_to_point(
             pallas_group_hash(&S, "z.cash:SinsemillaS", chunk_le, 4);
         }
 
+        /* Sinsemilla step: acc <- (acc + S) + acc.
+         *
+         * The original implementation called pallas_from_jac() between the
+         * two adds to feed an affine `acc` into a mixed-add. That triggered
+         * one Fermat inversion *per chunk* — the dominant cost on STM32
+         * (≈ 250 modular squarings each), which wedged the FAP for so long
+         * the system thread-watchdog killed it before the loop finished.
+         *
+         * Here we keep `acc` fully projective and use the all-jacobian
+         * RCB add (Algorithm 7). It is a few extra multiplications per
+         * step, but no inversion — total Sinsemilla cost drops by roughly
+         * an order of magnitude on a 64 MHz Cortex-M4. */
         static pallas_jac tmp;
         pallas_jac_add_mixed(&tmp, &acc, &S);
-        pallas_point acc_affine;
-        pallas_from_jac(&acc_affine, &acc);
-        pallas_jac_add_mixed(&tmp, &tmp, &acc_affine);
+        pallas_jac_add(&tmp, &tmp, &acc);
         acc = tmp;
     }
 

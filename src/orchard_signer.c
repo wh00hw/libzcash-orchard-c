@@ -124,10 +124,62 @@ OrchardSignerError orchard_signer_feed_transparent_output(OrchardSignerCtx *ctx,
         return SIGNER_ERR_BAD_STATE;
     }
 
+    /* Capture (value, script_pubkey) for the per-output display BEFORE
+     * the hash so we own a clean copy. Wire format:
+     *   value[8 LE] || script_pubkey_len[2 LE] || script_pubkey[N]
+     * If the bounded display array is full we refuse the tx — the
+     * no-blind-signing invariant requires every output we sign to be
+     * displayable on the trusted screen. */
+    if (data_len < 10) return SIGNER_ERR_TRANSPARENT_BAD_OUTPUT;
+    uint16_t idx = ctx->transparent_state.outputs_received;
+    if (idx >= ORCHARD_SIGNER_MAX_T_OUTPUTS) {
+        orchard_signer_reset(ctx);
+        return SIGNER_ERR_TOO_MANY_ACTIONS;
+    }
+    uint64_t value = 0;
+    for (int b = 0; b < 8; b++) value |= ((uint64_t)data[b]) << (8 * b);
+    uint16_t script_len = (uint16_t)data[8] | ((uint16_t)data[9] << 8);
+    if ((size_t)10 + script_len != data_len) {
+        return SIGNER_ERR_TRANSPARENT_BAD_OUTPUT;
+    }
+    TransparentOutputDisplay *disp = &ctx->t_outputs_display[idx];
+    disp->value = value;
+    if (script_len > sizeof(disp->script)) {
+        /* Non-standard / oversized script — refuse rather than sign
+         * something we can't display. P2PKH (25 B) and P2SH (23 B) are
+         * the only standardised Zcash transparent output shapes. */
+        orchard_signer_reset(ctx);
+        return SIGNER_ERR_TRANSPARENT_BAD_OUTPUT;
+    }
+    memcpy(disp->script, data + 10, script_len);
+    disp->script_len = (uint8_t)script_len;
+
     if (!zip244_hash_transparent_output(&ctx->transparent_state, data, data_len)) {
         return SIGNER_ERR_TRANSPARENT_BAD_OUTPUT;
     }
 
+    return SIGNER_OK;
+}
+
+OrchardSignerError orchard_signer_get_transparent_output_display(
+    const OrchardSignerCtx *ctx,
+    uint16_t idx,
+    uint64_t *value_out,
+    uint8_t *script_out,
+    size_t script_out_cap,
+    size_t *script_len_out)
+{
+    if (idx >= ctx->transparent_state.outputs_received ||
+        idx >= ORCHARD_SIGNER_MAX_T_OUTPUTS) {
+        return SIGNER_ERR_INVALID_ACTION_INDEX;
+    }
+    const TransparentOutputDisplay *disp = &ctx->t_outputs_display[idx];
+    if (script_out_cap < disp->script_len) return SIGNER_ERR_BAD_STATE;
+    if (value_out) *value_out = disp->value;
+    if (script_out && disp->script_len > 0) {
+        memcpy(script_out, disp->script, disp->script_len);
+    }
+    if (script_len_out) *script_len_out = disp->script_len;
     return SIGNER_OK;
 }
 
