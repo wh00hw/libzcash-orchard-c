@@ -210,6 +210,31 @@ static HWP_NOINLINE bool run_per_output_review(HwpDispatcher* d) {
                                               addr_buf, value, d->user_ctx);
         if(r != HWP_UI_OK) return false;
 
+        /* Memo review — only when (a) the firmware opted into the memo UI
+         * callback, AND (b) the action was fed via the v5 (memo-aware)
+         * path, AND (c) the memo is not the ZIP-302 empty-memo sentinel
+         * (lead byte 0xF6). The cryptographic binding from
+         * feed_action_with_note_and_memo() ensures the bytes the user
+         * sees here are byte-for-byte what ends up in the on-chain
+         * enc_ciphertext, closing the "memo bound but not user-visible"
+         * gap that AEAD recomputation alone leaves open.
+         *
+         * `memo_buf` is static to keep run_per_output_review under the
+         * 512 B per-function stack budget — same pattern used elsewhere
+         * for the larger Pallas / AEAD scratchpads. Single-threaded
+         * signer => no re-entrancy. */
+        if(d->ui.review_memo != NULL) {
+            static uint8_t memo_buf[512];
+            bool memo_present = false;
+            if(orchard_signer_get_action_memo(d->signer, i, memo_buf, &memo_present)
+               == SIGNER_OK && memo_present && memo_buf[0] != 0xF6) {
+                HwpUiResult rm = d->ui.review_memo(
+                    (uint16_t)(n_t + i + 1), total,
+                    addr_buf, memo_buf, d->user_ctx);
+                if(rm != HWP_UI_OK) return false;
+            }
+        }
+
         if(orchard_signer_confirm_action(d->signer, i) != SIGNER_OK) {
             return false;
         }

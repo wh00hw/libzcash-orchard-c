@@ -110,6 +110,36 @@ typedef struct HwpDispatcherUi {
      * invariant — at a degraded UX cost (the fee appears as another
      * "output" row). */
     HwpUiResult (*review_fee)(uint64_t fee_zats, void* ctx);
+    /* Per-Orchard-output memo review. Called once per Orchard action,
+     * AFTER its recipient/value has been confirmed via review_output,
+     * with the 512-byte memo plaintext that was captured by
+     * orchard_signer_feed_action_with_note_and_memo() and verified
+     * (cryptographically bound to enc_ciphertext on chain).
+     *
+     * The firmware is responsible for parsing the ZIP-302 lead byte and
+     * rendering the memo accordingly:
+     *   memo[0] == 0xF6                  -> empty memo; the dispatcher
+     *                                       SKIPS the callback entirely
+     *                                       (no prompt)
+     *   memo[0] in 0x00..0xF4            -> UTF-8 text (trim trailing
+     *                                       0x00 padding)
+     *   memo[0] == 0xF5 or 0xF7..0xFF    -> opaque / non-text (firmware
+     *                                       renders as hex or refuses)
+     *
+     * Optional: if NULL the dispatcher emits no memo prompt, leaving
+     * memo verification to its cryptographic binding only. Existing
+     * firmwares that have not been updated for HWP v5 keep working
+     * without code changes at the cost of leaving the
+     * "memo bound but not user-visible" gap open (a hostile companion
+     * could show the user a different memo from the one declared to the
+     * device — the binding catches divergence between declared-memo
+     * and on-chain enc_ciphertext, but NOT divergence between
+     * UI-displayed memo and declared-memo). */
+    HwpUiResult (*review_memo)(uint16_t action_idx_1_based,
+                                uint16_t total_actions,
+                                const char* recipient_addr_str,
+                                const uint8_t memo[512],
+                                void* ctx);
     /* Final tx confirmation. `recipient_str` is the NUL-terminated UA
      * string the host advertised in SIGN_REQ. */
     HwpUiResult (*confirm_tx)(uint64_t amount, uint64_t fee,

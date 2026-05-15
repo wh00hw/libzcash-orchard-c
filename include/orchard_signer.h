@@ -136,6 +136,25 @@ typedef struct {
     uint8_t recipient[43];   /* d[11] || pk_d[32] */
     uint64_t value;          /* output note value in zatoshis */
     bool confirmed;          /* set by orchard_signer_confirm_action() */
+    /* 512-byte memo plaintext, captured from feed_action_with_note_and_memo()
+     * after the on-device enc_ciphertext recomputation has verified it
+     * matches the action bytes. Empty (lead-byte 0xF6, rest unspecified)
+     * when no memo was supplied. Surfaced to the firmware UI via
+     * orchard_signer_get_action_memo() so the user can verify the memo
+     * contents on the trusted screen — without this step, a hostile
+     * companion could show one memo on its untrusted UI and declare a
+     * different (but cryptographically consistent) memo to the device.
+     *
+     * Set to all-zero when the action was fed via the cmx-only
+     * feed_action_with_note() path (no memo available).
+     *
+     * Memo content interpretation follows ZIP-302:
+     *   bytes[0] == 0xF6                 -> empty memo
+     *   bytes[0] in 0x00..0xF4           -> UTF-8 text (trim trailing 0x00)
+     *   bytes[0] == 0xF5 or 0xF7..0xFF   -> opaque / non-text
+     */
+    uint8_t memo[512];
+    bool memo_present;       /* true iff feed_action_with_note_and_memo() captured a memo */
 } OrchardActionDisplay;
 
 /**
@@ -348,6 +367,37 @@ OrchardSignerError orchard_signer_get_action_display(
     uint16_t idx,
     uint8_t recipient_out[43],
     uint64_t *value_out);
+
+/**
+ * Read out the 512-byte memo plaintext captured for the given action
+ * index. Returned only when the action was fed via the v5 path
+ * (feed_action_with_note_and_memo); the cmx-only v4 path captures no
+ * memo and `*present_out` is set to false.
+ *
+ * The firmware uses this to render the memo on the trusted screen so
+ * the user can verify the memo content end-to-end (cryptographic
+ * binding is necessary but not sufficient — a hostile companion can
+ * show one memo to the user on its untrusted UI while declaring a
+ * different one to the device; without on-device rendering the user
+ * cannot detect the divergence).
+ *
+ * Memo bytes follow ZIP-302:
+ *   bytes[0] == 0xF6                 -> empty memo (firmware may skip the prompt)
+ *   bytes[0] in 0x00..0xF4           -> UTF-8 text (trim trailing 0x00)
+ *   bytes[0] == 0xF5 or 0xF7..0xFF   -> opaque / non-text (render hex)
+ *
+ * @param ctx           Signing context
+ * @param idx           Action index, 0 .. actions_received - 1
+ * @param memo_out      512-byte output buffer (written only on success)
+ * @param present_out   Set to true iff a memo was captured for this action
+ *
+ * @return SIGNER_OK, or SIGNER_ERR_INVALID_ACTION_INDEX if idx is out of range.
+ */
+OrchardSignerError orchard_signer_get_action_memo(
+    const OrchardSignerCtx *ctx,
+    uint16_t idx,
+    uint8_t memo_out[512],
+    bool *present_out);
 
 /**
  * Constant-time check whether a 43-byte raw Orchard recipient (d || pk_d)

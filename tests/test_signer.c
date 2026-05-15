@@ -295,6 +295,60 @@ static void test_memo_full_consistency_accepted(void) {
     printf("  PASS: action with consistent cmx + epk + enc_ciphertext accepted\n");
 }
 
+static void test_memo_captured_for_display(void) {
+    /* After feed_action_with_note_and_memo() succeeds, the firmware must
+     * be able to retrieve the memo bytes via get_action_memo() so it
+     * can render them on the trusted screen. Without this, the AEAD
+     * binding catches "memo on chain != memo declared" but the user
+     * cannot detect "memo declared != memo shown by companion UI". */
+    OrchardSignerCtx ctx;
+    uint8_t wire[125];
+    start_session_for_one_action(&ctx, wire);
+
+    uint8_t action[820];
+    assert(build_synthetic_action_v5(
+        action, note_commit_recipient, note_commit_value,
+        note_commit_rseed, test_memo) == 0);
+    assert(orchard_signer_feed_action_with_note_and_memo(
+        &ctx, action, sizeof(action),
+        note_commit_recipient, note_commit_value, note_commit_rseed,
+        test_memo) == SIGNER_OK);
+
+    uint8_t memo_out[512];
+    bool present = false;
+    assert(orchard_signer_get_action_memo(&ctx, 0, memo_out, &present) == SIGNER_OK);
+    assert(present == true);
+    assert(memcmp(memo_out, test_memo, 512) == 0);
+
+    /* Out-of-range index rejected. */
+    assert(orchard_signer_get_action_memo(&ctx, 1, memo_out, &present)
+           == SIGNER_ERR_INVALID_ACTION_INDEX);
+
+    printf("  PASS: memo captured and retrievable via get_action_memo\n");
+}
+
+static void test_memo_not_present_for_v4_feed(void) {
+    /* When the action was fed via the cmx-only feed_action_with_note()
+     * path, no memo is captured and get_action_memo reports
+     * present=false. Lets the firmware skip the memo-review step
+     * gracefully on legacy / OVK-None payloads. */
+    OrchardSignerCtx ctx;
+    uint8_t wire[125];
+    start_session_for_one_action(&ctx, wire);
+
+    uint8_t action[820];
+    build_synthetic_action(action, note_commit_rho, note_commit_expected_cmx);
+    assert(orchard_signer_feed_action_with_note(
+        &ctx, action, sizeof(action),
+        note_commit_recipient, note_commit_value, note_commit_rseed) == SIGNER_OK);
+
+    uint8_t memo_out[512];
+    bool present = true;  /* prove it gets overwritten to false */
+    assert(orchard_signer_get_action_memo(&ctx, 0, memo_out, &present) == SIGNER_OK);
+    assert(present == false);
+    printf("  PASS: v4 (cmx-only) feed leaves memo_present=false\n");
+}
+
 static void test_memo_tampered_memo_rejected(void) {
     /* Hostile companion: shows the user "Invoice #123" but inside
      * enc_ciphertext puts a different memo. We simulate by building the
@@ -840,6 +894,8 @@ int main(void) {
 
     printf("\nOrchard signer / memo+enc_ciphertext verification tests:\n");
     test_memo_full_consistency_accepted();
+    test_memo_captured_for_display();
+    test_memo_not_present_for_v4_feed();
     test_memo_tampered_memo_rejected();
     test_memo_tampered_rseed_rejected();
     test_memo_tampered_enc_ciphertext_rejected();

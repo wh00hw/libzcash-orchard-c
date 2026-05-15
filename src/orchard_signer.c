@@ -399,11 +399,16 @@ OrchardSignerError orchard_signer_feed_action_with_note_and_memo(
         return SIGNER_ERR_BAD_ACTION;
     }
 
-    /* Capture display info, identical to feed_action_with_note. */
+    /* Capture display info — identical to feed_action_with_note, PLUS the
+     * memo plaintext so the firmware UI can render it on the trusted
+     * screen (closes the "memo bound but not user-visible" gap that the
+     * AEAD recomputation alone leaves open). */
     OrchardActionDisplay *disp = &ctx->actions_display[ctx->actions_received];
     memcpy(disp->recipient, recipient, 43);
     disp->value = value;
     disp->confirmed = false;
+    memcpy(disp->memo, memo, 512);
+    disp->memo_present = true;
 
     ctx->actions_received++;
     return SIGNER_OK;
@@ -421,6 +426,21 @@ OrchardSignerError orchard_signer_get_action_display(
     const OrchardActionDisplay *disp = &ctx->actions_display[idx];
     if (recipient_out) memcpy(recipient_out, disp->recipient, 43);
     if (value_out)     *value_out = disp->value;
+    return SIGNER_OK;
+}
+
+OrchardSignerError orchard_signer_get_action_memo(
+    const OrchardSignerCtx *ctx,
+    uint16_t idx,
+    uint8_t memo_out[512],
+    bool *present_out)
+{
+    if (idx >= ctx->actions_received) {
+        return SIGNER_ERR_INVALID_ACTION_INDEX;
+    }
+    const OrchardActionDisplay *disp = &ctx->actions_display[idx];
+    if (memo_out)    memcpy(memo_out, disp->memo, 512);
+    if (present_out) *present_out = disp->memo_present;
     return SIGNER_OK;
 }
 
