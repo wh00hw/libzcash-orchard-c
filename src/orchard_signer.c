@@ -349,6 +349,12 @@ OrchardSignerError orchard_signer_feed_action_with_note_and_memo(
     const uint8_t *action_epk = action_data + ORCHARD_ACTION_OFFSET_EPK;
     const uint8_t *action_enc = action_data + ORCHARD_ACTION_OFFSET_ENC;
 
+    /* Static-storage for the 580 B recomputed-ciphertext buffer so the
+     * function frame stays within the 512 B per-function stack budget.
+     * Same pattern as orchard_compute_enc_ciphertext() and the other
+     * Pallas heavyweights. Single-threaded signer => no re-entrancy. */
+    static uint8_t computed_enc[ORCHARD_ACTION_ENC_SIZE];
+
     /* Step 1: cmx recomputation — same as feed_action_with_note(). */
     uint8_t computed_cmx[32];
     orchard_compute_cmx(d, pk_d, value, rho, rseed, computed_cmx);
@@ -363,7 +369,6 @@ OrchardSignerError orchard_signer_feed_action_with_note_and_memo(
      * and cross-check both ciphertext + epk against the action bytes. esk
      * is derived internally from rseed + rho per ZIP-212. Closes the
      * memo-substitution gap that cmx alone leaves open. */
-    uint8_t computed_enc[ORCHARD_ACTION_ENC_SIZE];
     uint8_t computed_epk[32];
     int rc = orchard_compute_enc_ciphertext_from_rseed(
         d, pk_d, value, rseed, rho, memo,

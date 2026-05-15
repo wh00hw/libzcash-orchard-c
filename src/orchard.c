@@ -1091,24 +1091,36 @@ int orchard_compute_enc_ciphertext(
     uint8_t enc_ciphertext_out[580],
     uint8_t epk_out[32])
 {
+    /* Static-storage locals to stay within the embedded 512 B per-function
+     * stack budget (audit: scripts/check_stack.sh). Same pattern as
+     * orchard_compute_cmx() and zip244_transparent_per_input_sighash().
+     * The signer state machine is single-threaded per call so re-entrancy
+     * is a non-issue; every secret byte is memzero'd before return. */
+    static pallas_point g_d;
+    static pallas_point epk;
+    static pallas_point pk_d_pt;
+    static pallas_point ss;
+    static bignum256 esk_bn;
+    static uint8_t epk_bytes[32];
+    static uint8_t ss_bytes[32];
+    static uint8_t k_enc[32];
+    static uint8_t np[564];
+    static blake2b_state h;
+    static const uint8_t zero_nonce[12] = {0};
+
     /* 1. g_d = DiversifyHash(d). Same hash-to-curve used by cmx. */
-    pallas_point g_d;
     pallas_hash_to_curve(&g_d, "z.cash:Orchard-gd", d, 11);
 
     /* 2. esk as Pallas scalar (the companion-supplied 32 bytes are
      *    treated verbatim, mod q; pallas_point_mul handles reduction). */
-    bignum256 esk_bn;
     bn_read_le(esk, &esk_bn);
 
     /* 3. epk = [esk]·g_d, encoded as repr_P. */
-    pallas_point epk;
     pallas_point_mul(&epk, &esk_bn, &g_d);
-    uint8_t epk_bytes[32];
     pallas_encode_repr_p(epk_bytes, &epk);
     if (epk_out) memcpy(epk_out, epk_bytes, 32);
 
     /* 4. SharedSecret = [esk]·pk_d. */
-    pallas_point pk_d_pt;
     if (pallas_decode_repr_p(&pk_d_pt, pk_d) != 0) {
         memzero(&g_d, sizeof(g_d));
         memzero(&epk, sizeof(epk));
@@ -1116,25 +1128,18 @@ int orchard_compute_enc_ciphertext(
         memzero(epk_bytes, sizeof(epk_bytes));
         return -1;
     }
-    pallas_point ss;
     pallas_point_mul(&ss, &esk_bn, &pk_d_pt);
-    uint8_t ss_bytes[32];
     pallas_encode_repr_p(ss_bytes, &ss);
 
     /* 5. K_enc = BLAKE2b-256("Zcash_OrchardKDF", epk_bytes || ss_bytes).
      *    Matches Zcash protocol spec §5.4.4.6 / §4.20. */
-    uint8_t k_enc[32];
-    {
-        blake2b_state h;
-        blake2b_InitPersonal(&h, 32, "Zcash_OrchardKDF", 16);
-        blake2b_Update(&h, epk_bytes, 32);
-        blake2b_Update(&h, ss_bytes, 32);
-        blake2b_Final(&h, k_enc, 32);
-    }
+    blake2b_InitPersonal(&h, 32, "Zcash_OrchardKDF", 16);
+    blake2b_Update(&h, epk_bytes, 32);
+    blake2b_Update(&h, ss_bytes, 32);
+    blake2b_Final(&h, k_enc, 32);
 
     /* 6. Note plaintext (564 bytes):
      *   leadByte(0x02) || d(11) || value_LE(8) || rseed(32) || memo(512) */
-    uint8_t np[564];
     np[0] = 0x02;
     memcpy(np + 1, d, 11);
     for (int i = 0; i < 8; i++) {
@@ -1146,7 +1151,6 @@ int orchard_compute_enc_ciphertext(
     /* 7. enc_ciphertext = ChaCha20-Poly1305_Encrypt(K_enc, nonce=0, np)
      *    The 16-byte tag is appended after the 564-byte ciphertext for a
      *    total of 580 bytes, matching the layout the on-chain action uses. */
-    static const uint8_t zero_nonce[12] = {0};
     chacha20poly1305_encrypt(
         k_enc, zero_nonce,
         NULL, 0,
@@ -1163,5 +1167,6 @@ int orchard_compute_enc_ciphertext(
     memzero(&g_d, sizeof(g_d));
     memzero(&pk_d_pt, sizeof(pk_d_pt));
     memzero(&esk_bn, sizeof(esk_bn));
+    memzero(&h, sizeof(h));
     return 0;
 }
