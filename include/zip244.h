@@ -98,6 +98,16 @@ typedef struct {
     blake2b_state scripts_ctx;     /* "ZTxTrScriptsHash" (per-input sighash) */
     uint16_t inputs_received;
     uint16_t outputs_received;
+    /* Per-input/output value running totals (zatoshis), independent of the
+     * BLAKE2b digests. Used by the orchard signer to compute the on-device
+     * fee = t_in_total - t_out_total + value_balance, so the user can be
+     * asked to confirm the fee value itself (closes the "companion-claimed
+     * fee != real fee" gap — a hostile companion could inflate value_balance
+     * and pay extra to miners while showing a small fee in its own UI). */
+    uint64_t t_in_total;
+    uint64_t t_out_total;
+    bool t_in_overflow;            /* set if any add overflowed */
+    bool t_out_overflow;
     bool initialized;
 } Zip244TransparentState;
 

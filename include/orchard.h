@@ -206,3 +206,71 @@ void orchard_compute_cmx(
     const uint8_t rho[32],
     const uint8_t rseed[32],
     uint8_t cmx_out[32]);
+
+/**
+ * Recompute the 580-byte Orchard `enc_ciphertext` for an output note from
+ * the unencrypted note plaintext + the companion-supplied ephemeral secret.
+ *
+ * Used by the on-device signer to verify, byte-for-byte, that the
+ * companion's claim about what the recipient will see (recipient, value,
+ * rseed, and crucially the 512-byte memo) matches what the action
+ * actually commits to. Without this check, the memo bytes are
+ * companion-controlled even after the cmx-recomputation defence is in
+ * place: cmx binds (d, pk_d, value, rho, rseed) but does NOT cover the
+ * memo, so a host that shows the user "invoice #123" on its untrusted
+ * screen can put "pay extra to X" inside `enc_ciphertext` and the user
+ * has no way to know.
+ *
+ * Steps (per Zcash protocol spec §5.4.4.6 / §4.20):
+ *   g_d          = DiversifyHash(d)                         (Pallas pt)
+ *   epk          = [esk]·g_d                                 (Pallas pt)
+ *   SharedSecret = [esk]·pk_d                                (Pallas pt)
+ *   K_enc        = BLAKE2b-256("Zcash_OrchardKDF",
+ *                              repr_P(epk) || repr_P(ss))
+ *   np           = leadByte(0x02) || d(11) || value_LE(8) ||
+ *                  rseed(32) || memo(512)                    (564 bytes)
+ *   enc_ciphertext = ChaCha20-Poly1305_Encrypt(K_enc, nonce=0, np)
+ *
+ * On the device the caller compares `enc_ciphertext_out` constant-time
+ * against the action's `enc_ciphertext` field; a mismatch means the
+ * companion lied about the note plaintext, ephemeral secret, or both,
+ * and the session must be aborted.
+ *
+ * Returns 0 on success, -1 if pk_d does not decode to a valid Pallas
+ * point (i.e. x^3 + 5 is a non-square mod p — a structurally invalid
+ * companion input).
+ */
+int orchard_compute_enc_ciphertext(
+    const uint8_t d[11],
+    const uint8_t pk_d[32],
+    uint64_t value,
+    const uint8_t rseed[32],
+    const uint8_t memo[512],
+    const uint8_t esk[32],
+    uint8_t enc_ciphertext_out[580],
+    uint8_t epk_out[32]);
+
+/**
+ * Same as orchard_compute_enc_ciphertext(), but derives `esk` internally
+ * from `rseed` + `rho` per ZIP-212:
+ *
+ *     esk = ToScalar(PRF^expand(rseed, [0x04] || rho))
+ *
+ * The device uses this variant when verifying an action's enc_ciphertext
+ * because esk is structurally redundant on the wire — both ends compute
+ * the same value from the same inputs. The orchard signer's
+ * feed_action_with_note_and_memo() path calls this so the host can omit
+ * esk from the per-action payload.
+ *
+ * @param rho  32 bytes (typically the action's nullifier field, i.e.
+ *             `action_data + OFF_NULLIFIER`)
+ */
+int orchard_compute_enc_ciphertext_from_rseed(
+    const uint8_t d[11],
+    const uint8_t pk_d[32],
+    uint64_t value,
+    const uint8_t rseed[32],
+    const uint8_t rho[32],
+    const uint8_t memo[512],
+    uint8_t enc_ciphertext_out[580],
+    uint8_t epk_out[32]);

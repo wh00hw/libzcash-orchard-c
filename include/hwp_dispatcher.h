@@ -96,6 +96,20 @@ typedef struct HwpDispatcherUi {
     HwpUiResult (*review_output)(uint16_t idx_1_based, uint16_t total,
                                   const char* addr_str, uint64_t value,
                                   void* ctx);
+    /* Per-tx fee review. Called once, AFTER every output has been
+     * confirmed, with the on-device-computed miner fee
+     * (= t_in - t_out + value_balance, evaluated by the library — NOT
+     * a number supplied by the companion). The user must approve this
+     * value or the signer refuses to advance past verify(), so a
+     * hostile companion that inflates value_balance to siphon ZEC into
+     * the miner fee cannot extract a signature.
+     *
+     * Optional: if a firmware leaves this NULL, the dispatcher falls
+     * back to calling review_output() with addr_str = "Network fee"
+     * so existing UIs still satisfy the no-blind-signing-for-fee
+     * invariant — at a degraded UX cost (the fee appears as another
+     * "output" row). */
+    HwpUiResult (*review_fee)(uint64_t fee_zats, void* ctx);
     /* Final tx confirmation. `recipient_str` is the NUL-terminated UA
      * string the host advertised in SIGN_REQ. */
     HwpUiResult (*confirm_tx)(uint64_t amount, uint64_t fee,

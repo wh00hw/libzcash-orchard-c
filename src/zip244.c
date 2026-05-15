@@ -106,6 +106,16 @@ bool zip244_hash_transparent_input(Zip244TransparentState *state,
     /* amounts_digest: value[8 LE] (as i64, same bytes for non-negative) */
     blake2b_Update(&state->amounts_ctx, data + 40, 8);
 
+    /* Accumulate the per-input value into the running total used for
+     * on-device fee computation. Negative values are nonsensical for a
+     * Bitcoin/Zcash UTXO input; treat the wire bytes as unsigned and
+     * flag overflow so the signer surfaces an error rather than wrapping. */
+    uint64_t v = 0;
+    for (int i = 7; i >= 0; i--) v = (v << 8) | data[40 + i];
+    uint64_t new_total = state->t_in_total + v;
+    if (new_total < state->t_in_total) state->t_in_overflow = true;
+    state->t_in_total = new_total;
+
     /* scripts_digest: CompactSize(script_len) || script_pubkey
      * Wire format has script_pubkey_len as 2-byte LE at offset 48 */
     uint16_t script_len = (uint16_t)data[48] | ((uint16_t)data[49] << 8);
@@ -143,6 +153,14 @@ bool zip244_hash_transparent_output(Zip244TransparentState *state,
     size_t cs_len = write_compact_size(cs_buf, script_len);
     blake2b_Update(&state->outputs_ctx, cs_buf, cs_len);
     blake2b_Update(&state->outputs_ctx, script, script_len);
+
+    /* Accumulate output value for on-device fee computation (see notes
+     * on zip244_hash_transparent_input). */
+    uint64_t v = 0;
+    for (int i = 7; i >= 0; i--) v = (v << 8) | value[i];
+    uint64_t new_total = state->t_out_total + v;
+    if (new_total < state->t_out_total) state->t_out_overflow = true;
+    state->t_out_total = new_total;
 
     state->outputs_received++;
     return true;

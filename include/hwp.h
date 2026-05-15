@@ -17,8 +17,14 @@
 
 #define HWP_HEADER_SIZE   6
 #define HWP_CRC_SIZE      2
-#define HWP_MAX_PAYLOAD   1024
-#define HWP_MAX_FRAME     (HWP_HEADER_SIZE + HWP_MAX_PAYLOAD + HWP_CRC_SIZE) // 1032
+// Bumped from 1024 to 2048 in v5 to fit the action+full-note-plaintext+memo+
+// esk payload (1447 bytes) used by orchard_signer_feed_action_with_note_and_memo.
+// The earlier 1024-byte cap was sized for v4 (903-byte payload); v5 needs more
+// for the 512-byte memo and the 32-byte esk required to recompute
+// enc_ciphertext on-device. Firmware buffers (in + out) grow accordingly, ~2 KB
+// extra static SRAM per direction — fits comfortably on ESP32 / STM32WB targets.
+#define HWP_MAX_PAYLOAD   2048
+#define HWP_MAX_FRAME     (HWP_HEADER_SIZE + HWP_MAX_PAYLOAD + HWP_CRC_SIZE) // 2056
 
 // Action data size per TxOutput message (v2 sighash verification):
 // cv_net(32) + nullifier(32) + rk(32) + cmx(32) + ephemeral_key(32) + enc_ciphertext(580) + out_ciphertext(80)
@@ -30,6 +36,21 @@
 // recipient-substitution attacks. Total TX_OUTPUT action payload = 820 + 83 = 903.
 #define HWP_NOTE_PLAINTEXT_SIZE  83
 #define HWP_ACTION_DATA_SIZE_V4  (HWP_ACTION_DATA_SIZE + HWP_NOTE_PLAINTEXT_SIZE)
+
+// Full note plaintext for v5 (memo-verifying) protocol:
+// recipient(43) + value(8) + rseed(32) + memo(512) = 595 bytes
+// Total TX_OUTPUT action payload for v5 = 820 + 595 = 1415 bytes.
+//
+// The device uses recipient/value/rseed/memo to recompute the action's
+// `enc_ciphertext` byte-for-byte; mismatch aborts the session. Closes the
+// memo-substitution attack that v4 (cmx-only) leaves open.
+//
+// `esk` is NOT on the wire: per ZIP-212 it is a deterministic function
+// of rseed + rho (= action's nullifier), so the device derives it on-chip
+// from the same inputs the companion already supplies. Keeping esk off
+// the wire removes one trust-from-companion vector.
+#define HWP_NOTE_PLAINTEXT_V5_SIZE  (HWP_NOTE_PLAINTEXT_SIZE + 512)
+#define HWP_ACTION_DATA_SIZE_V5  (HWP_ACTION_DATA_SIZE + HWP_NOTE_PLAINTEXT_V5_SIZE)
 
 // TxOutput special indices for v2 sighash verification protocol:
 // 0xFFFF = transaction metadata (header + orchard bundle info, 61 bytes)
@@ -80,6 +101,19 @@ typedef enum {
                                                 // (recipient-substitution attempt)
     HWP_ERR_RECIPIENT_MISMATCH          = 0x0E, // SIGN_REQ.recipient (UA) does
                                                 // not match any confirmed action
+    HWP_ERR_MEMO_MISMATCH               = 0x0F, // Device-recomputed enc_ciphertext
+                                                // (or epk) does not match the
+                                                // action — companion lied about
+                                                // memo/esk to extract a signature
+                                                // for a different on-chain memo
+    HWP_ERR_BAD_PK_D                    = 0x10, // pk_d does not decode to a
+                                                // valid Pallas point
+    HWP_ERR_FEE_NOT_CONFIRMED           = 0x11, // verify() reached without user
+                                                // approving the on-device fee
+    HWP_ERR_FEE_OVERFLOW                = 0x12, // transparent value sums or
+                                                // value_balance combine to an
+                                                // out-of-range fee
+    HWP_ERR_FEE_NEGATIVE                = 0x13, // t_in + value_balance < t_out
 } HwpErrorCode;
 
 // FVK_REQ payload (v2.1+):
@@ -130,6 +164,26 @@ typedef struct {
     uint64_t value;              /* zatoshis (host order, parsed from 8 LE bytes) */
     const uint8_t* rseed;        /* 32 bytes */
 } HwpActionV4;
+
+/**
+ * View of a TX_OUTPUT action payload (v5 format) — same as v4 plus the
+ * 512-byte memo plaintext. The device uses these to recompute the action's
+ * `enc_ciphertext` and `ephemeral_key`, closing the memo-substitution
+ * attack that v4 leaves open (cmx alone binds value/recipient but not memo
+ * bytes). `esk` is derived on-device from `rseed + rho` per ZIP-212.
+ *
+ *   wire_payload[output_data] =
+ *     action[820] || recipient[43] || value[8 LE] || rseed[32] || memo[512]
+ *
+ * Pointers reference the original payload buffer (no copy).
+ */
+typedef struct {
+    const uint8_t* action;       /* HWP_ACTION_DATA_SIZE = 820 bytes */
+    const uint8_t* recipient;    /* 43 bytes = d[11] || pk_d[32] */
+    uint64_t value;              /* zatoshis */
+    const uint8_t* rseed;        /* 32 bytes */
+    const uint8_t* memo;         /* 512 bytes (ZIP-302 note memo plaintext) */
+} HwpActionV5;
 
 typedef struct {
     uint8_t version;
@@ -200,6 +254,12 @@ bool hwp_parse_tx_output(const uint8_t* payload, uint16_t len, HwpTxOutput* out)
 // data length is not exactly HWP_ACTION_DATA_SIZE_V4.
 bool hwp_parse_action_v4(const uint8_t* output_data, uint16_t output_data_len,
                          HwpActionV4* out);
+
+// Split a v5 action+full-note-plaintext+memo+esk output_data block
+// (HWP_ACTION_DATA_SIZE_V5 = 1447 bytes) into its constituents. Returns
+// true on success, false if the data length is not exactly that.
+bool hwp_parse_action_v5(const uint8_t* output_data, uint16_t output_data_len,
+                         HwpActionV5* out);
 
 // TRANSPARENT_SIGN_REQ payload (v3):
 //   input_index[2 LE] || total_inputs[2 LE] ||

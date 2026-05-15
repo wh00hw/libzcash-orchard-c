@@ -34,6 +34,7 @@ set(CRYPTO_SOURCES
     src/hash_stubs.c
     src/aes/aes_ct.c
     src/aead.c
+    src/chacha20poly1305.c
     src/wallet_lockout.c
     # The Brian Gladman AES files (aescrypt.c, aeskey.c, aes_modes.c,
     # aestab.c) were removed from the build in the security-audit

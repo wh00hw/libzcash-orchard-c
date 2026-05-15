@@ -22,7 +22,11 @@
 #include <string.h>
 
 /* Build a minimal-but-valid 125-byte TxMeta wire payload with the given
- * sapling_digest. Other fields are set to plausible Nu5-mainnet values. */
+ * sapling_digest. Other fields are set to plausible Nu5-mainnet values.
+ * The transparent_sig_digest is populated with the empty-bundle constant
+ * BLAKE2b-256("ZTxIdTranspaHash", "") so verify() does not reject the
+ * fixture as a hostile-companion "non-empty digest with skipped transparent
+ * flow" attempt. Callers that exercise transparent flow patch this field. */
 static void build_tx_meta_wire(uint8_t buf[125], const uint8_t sapling_digest[32]) {
     memset(buf, 0, 125);
     /* version = 5, version_group_id = 0x26A7270A (Nu5), branch_id = 0xC2D6D0B4 (Nu5),
@@ -33,7 +37,10 @@ static void build_tx_meta_wire(uint8_t buf[125], const uint8_t sapling_digest[32
     /* orchard_flags = 0x03 (spends + outputs enabled) */
     buf[20] = 0x03;
     /* value_balance = 0, anchor = 32 zero bytes (offset 29..60) */
-    /* transparent_sig_digest = 32 zero bytes (offset 61..92) — not validated here */
+    /* transparent_sig_digest at offset 61..92: empty-bundle constant */
+    uint8_t transparent_empty[32];
+    zip244_empty_digest("ZTxIdTranspaHash", transparent_empty);
+    memcpy(buf + 61, transparent_empty, 32);
     /* sapling_digest at offset 93 */
     memcpy(buf + 93, sapling_digest, 32);
 }
@@ -220,6 +227,163 @@ static void test_note_commit_wrong_action_size_rejected(void) {
 }
 
 /* ----------------------------------------------------------------------- */
+/*  Memo / enc_ciphertext verification (v5 feed)                           */
+/* ----------------------------------------------------------------------- */
+/*
+ * orchard_signer_feed_action_with_note_and_memo must:
+ *   - accept an action whose enc_ciphertext + epk match the recomputed
+ *     values from (d, pk_d, value, rseed, memo, esk)
+ *   - reject (SIGNER_ERR_MEMO_MISMATCH) any tamper on memo or esk
+ *   - reject pk_d that does not decode (SIGNER_ERR_BAD_PK_D)
+ *
+ * Builds an action where cmx, ephemeral_key and enc_ciphertext are all
+ * recomputed live from a known set of note-plaintext inputs, so the test
+ * exercises the full ECDH-Pallas + ChaCha20-Poly1305 path that the
+ * companion would normally provide pre-computed.
+ */
+
+/* Build a synthetic 820-byte action whose nullifier (rho), cmx, epk and
+ * enc_ciphertext are consistent with (recipient, value, rseed, memo).
+ * esk is derived from rseed + rho per ZIP-212 — the same derivation the
+ * device performs internally, so we use the same primitive here.
+ * Returns 0 on success, non-zero if pk_d decoding fails. */
+static int build_synthetic_action_v5(uint8_t out[820],
+                                      const uint8_t recipient[43],
+                                      uint64_t value,
+                                      const uint8_t rseed[32],
+                                      const uint8_t memo[512]) {
+    memset(out, 0, 820);
+    /* Pick an arbitrary nullifier as rho. Real Orchard uses a derived
+     * value; for this fixture any 32 bytes work — cmx and enc_ciphertext
+     * are computed against this rho. */
+    for (int i = 0; i < 32; i++) out[32 + i] = (uint8_t)(0x42 ^ i);
+
+    /* cmx at offset 96 */
+    orchard_compute_cmx(recipient, recipient + 11, value,
+                        out + 32, rseed, out + 96);
+
+    /* enc_ciphertext at offset 160, epk at offset 128 */
+    return orchard_compute_enc_ciphertext_from_rseed(
+        recipient, recipient + 11, value, rseed, out + 32, memo,
+        out + 160, out + 128);
+}
+
+/* A reusable memo fixture. */
+static const uint8_t test_memo[512] = {
+    'H','e','l','l','o',' ','M','a','r','i','o','!',' ',
+    'I','n','v','o','i','c','e',' ','#','1','2','3',
+    /* rest is implicit zero */
+};
+
+static void test_memo_full_consistency_accepted(void) {
+    OrchardSignerCtx ctx;
+    uint8_t wire[125];
+    start_session_for_one_action(&ctx, wire);
+
+    uint8_t action[820];
+    int built = build_synthetic_action_v5(
+        action, note_commit_recipient, note_commit_value,
+        note_commit_rseed, test_memo);
+    assert(built == 0);
+
+    OrchardSignerError err = orchard_signer_feed_action_with_note_and_memo(
+        &ctx, action, sizeof(action),
+        note_commit_recipient, note_commit_value, note_commit_rseed,
+        test_memo);
+    assert(err == SIGNER_OK);
+    assert(ctx.actions_received == 1);
+    printf("  PASS: action with consistent cmx + epk + enc_ciphertext accepted\n");
+}
+
+static void test_memo_tampered_memo_rejected(void) {
+    /* Hostile companion: shows the user "Invoice #123" but inside
+     * enc_ciphertext puts a different memo. We simulate by building the
+     * action with the real memo, then telling feed() that the memo
+     * was something else. */
+    OrchardSignerCtx ctx;
+    uint8_t wire[125];
+    start_session_for_one_action(&ctx, wire);
+
+    uint8_t action[820];
+    int built = build_synthetic_action_v5(
+        action, note_commit_recipient, note_commit_value,
+        note_commit_rseed, test_memo);
+    assert(built == 0);
+
+    uint8_t fake_memo[512];
+    memcpy(fake_memo, test_memo, 512);
+    fake_memo[100] ^= 1;  /* flip one bit somewhere in the middle */
+
+    OrchardSignerError err = orchard_signer_feed_action_with_note_and_memo(
+        &ctx, action, sizeof(action),
+        note_commit_recipient, note_commit_value, note_commit_rseed,
+        fake_memo);
+    assert(err == SIGNER_ERR_MEMO_MISMATCH);
+    assert(ctx.state == SIGNER_IDLE);  /* context reset */
+    printf("  PASS: tampered memo (1-bit flip) rejected, ctx reset\n");
+}
+
+static void test_memo_tampered_rseed_rejected(void) {
+    /* esk is derived from rseed + rho per ZIP-212; flipping rseed
+     * therefore changes both the recomputed cmx AND the K_enc → memo
+     * encryption. cmx mismatch fires first; the test checks rseed
+     * tamper detection regardless of which leg catches it. */
+    OrchardSignerCtx ctx;
+    uint8_t wire[125];
+    start_session_for_one_action(&ctx, wire);
+
+    uint8_t action[820];
+    int built = build_synthetic_action_v5(
+        action, note_commit_recipient, note_commit_value,
+        note_commit_rseed, test_memo);
+    assert(built == 0);
+
+    uint8_t fake_rseed[32];
+    memcpy(fake_rseed, note_commit_rseed, 32);
+    fake_rseed[0] ^= 1;
+
+    OrchardSignerError err = orchard_signer_feed_action_with_note_and_memo(
+        &ctx, action, sizeof(action),
+        note_commit_recipient, note_commit_value, fake_rseed,
+        test_memo);
+    /* Either NOTE_COMMITMENT_MISMATCH (cmx leg fires first) or
+     * MEMO_MISMATCH would be a correct rejection; we just require the
+     * session is reset. */
+    assert(err == SIGNER_ERR_NOTE_COMMITMENT_MISMATCH ||
+           err == SIGNER_ERR_MEMO_MISMATCH);
+    assert(ctx.state == SIGNER_IDLE);
+    printf("  PASS: tampered rseed rejected (cmx or memo), ctx reset\n");
+}
+
+static void test_memo_tampered_enc_ciphertext_rejected(void) {
+    /* Hostile companion: leaves memo/rseed truthful but mangles
+     * enc_ciphertext bytes in the action. Real-world version of the
+     * "I tell you what the memo says but write something else on chain"
+     * attack — the device must catch the divergence and abort. */
+    OrchardSignerCtx ctx;
+    uint8_t wire[125];
+    start_session_for_one_action(&ctx, wire);
+
+    uint8_t action[820];
+    int built = build_synthetic_action_v5(
+        action, note_commit_recipient, note_commit_value,
+        note_commit_rseed, test_memo);
+    assert(built == 0);
+
+    /* Flip a byte inside enc_ciphertext (offset 160 + 200 = 360, still
+     * inside the memo portion of the ciphertext). */
+    action[360] ^= 1;
+
+    OrchardSignerError err = orchard_signer_feed_action_with_note_and_memo(
+        &ctx, action, sizeof(action),
+        note_commit_recipient, note_commit_value, note_commit_rseed,
+        test_memo);
+    assert(err == SIGNER_ERR_MEMO_MISMATCH);
+    assert(ctx.state == SIGNER_IDLE);
+    printf("  PASS: tampered enc_ciphertext (1-byte flip) rejected, ctx reset\n");
+}
+
+/* ----------------------------------------------------------------------- */
 /*  No-blind-signing invariant                                             */
 /* ----------------------------------------------------------------------- */
 /*
@@ -283,11 +447,105 @@ static void test_verify_accepts_after_confirm(void) {
     assert(value == note_commit_value);
     assert(orchard_signer_confirm_action(&ctx, 0) == SIGNER_OK);
 
+    /* Firmware also computes and confirms the miner fee — for this fixture
+     * value_balance is 0 and there is no transparent flow, so fee == 0. */
+    uint64_t fee;
+    assert(orchard_signer_get_fee(&ctx, &fee) == SIGNER_OK);
+    assert(fee == 0);
+    assert(orchard_signer_confirm_fee(&ctx) == SIGNER_OK);
+
     /* Now verify must succeed and transition to VERIFIED. */
     OrchardSignerError err = orchard_signer_verify(&ctx, sighash);
     assert(err == SIGNER_OK);
     assert(ctx.state == SIGNER_VERIFIED);
-    printf("  PASS: verify advances to VERIFIED once all actions confirmed\n");
+    printf("  PASS: verify advances to VERIFIED once all actions + fee confirmed\n");
+}
+
+static void test_verify_refuses_without_fee_confirm(void) {
+    /* All actions confirmed but fee not → verify must refuse with the
+     * no-blind-signing-for-fee invariant. */
+    OrchardSignerCtx ctx;
+    uint8_t wire[125];
+    start_session_for_one_action(&ctx, wire);
+
+    uint8_t action[820];
+    build_synthetic_action(action, note_commit_rho, note_commit_expected_cmx);
+    assert(orchard_signer_feed_action_with_note(
+        &ctx, action, sizeof(action),
+        note_commit_recipient, note_commit_value, note_commit_rseed) == SIGNER_OK);
+
+    uint8_t sighash[32];
+    compute_sighash(&ctx, sighash);
+
+    assert(orchard_signer_confirm_action(&ctx, 0) == SIGNER_OK);
+    /* Deliberately skip get_fee / confirm_fee. */
+
+    OrchardSignerError err = orchard_signer_verify(&ctx, sighash);
+    assert(err == SIGNER_ERR_FEE_NOT_CONFIRMED);
+    assert(ctx.state == SIGNER_RECEIVING_ACTIONS);   /* did not advance */
+    printf("  PASS: verify refuses (FEE_NOT_CONFIRMED) when fee not approved\n");
+}
+
+static void test_confirm_fee_refuses_without_get_fee(void) {
+    /* confirm_fee() before get_fee() must refuse: a firmware UI that
+     * "confirms" before computing would be approving a stale zero. */
+    OrchardSignerCtx ctx;
+    uint8_t wire[125];
+    start_session_for_one_action(&ctx, wire);
+
+    OrchardSignerError err = orchard_signer_confirm_fee(&ctx);
+    assert(err == SIGNER_ERR_BAD_STATE);
+    assert(ctx.fee_confirmed == false);
+    printf("  PASS: confirm_fee refuses before get_fee was called\n");
+}
+
+static void test_get_fee_orchard_only_returns_value_balance(void) {
+    /* For an Orchard-only tx (no transparent flow), fee == value_balance.
+     * Patch the wire to set value_balance = 10_000 zatoshis and check. */
+    OrchardSignerCtx ctx;
+    orchard_signer_init(&ctx);
+
+    uint8_t empty[32];
+    zip244_sapling_empty_digest(empty);
+    uint8_t wire[125];
+    build_tx_meta_wire(wire, empty);
+    /* value_balance is at offset 21 (i64 LE). 10_000 = 0x2710. */
+    wire[21] = 0x10; wire[22] = 0x27;
+
+    assert(orchard_signer_feed_meta(&ctx, wire, 125, 1) == SIGNER_OK);
+
+    uint64_t fee = 0xDEADBEEF;
+    assert(orchard_signer_get_fee(&ctx, &fee) == SIGNER_OK);
+    assert(fee == 10000);
+
+    /* Caching: second call returns the same value without recomputation. */
+    fee = 0;
+    assert(orchard_signer_get_fee(&ctx, &fee) == SIGNER_OK);
+    assert(fee == 10000);
+    printf("  PASS: orchard-only fee == value_balance (cached on second call)\n");
+}
+
+static void test_get_fee_rejects_negative(void) {
+    /* A bundle where t_in + value_balance < t_out is unbalanced. */
+    OrchardSignerCtx ctx;
+    orchard_signer_init(&ctx);
+
+    uint8_t empty[32];
+    zip244_sapling_empty_digest(empty);
+    uint8_t wire[125];
+    build_tx_meta_wire(wire, empty);
+    /* value_balance = -1000 (two's complement i64 LE). */
+    int64_t vb = -1000;
+    for (int i = 0; i < 8; i++) wire[21 + i] = (uint8_t)((uint64_t)vb >> (8 * i));
+
+    assert(orchard_signer_feed_meta(&ctx, wire, 125, 1) == SIGNER_OK);
+
+    uint64_t fee = 0;
+    OrchardSignerError err = orchard_signer_get_fee(&ctx, &fee);
+    assert(err == SIGNER_ERR_FEE_NEGATIVE);
+    /* On negative fee, ctx is reset — the partial session is discarded. */
+    assert(ctx.state == SIGNER_IDLE);
+    printf("  PASS: negative fee rejected (FEE_NEGATIVE), ctx reset\n");
 }
 
 static void test_verify_refuses_partial_confirm(void) {
@@ -580,6 +838,12 @@ int main(void) {
     test_note_commit_attacker_value_rejected();
     test_note_commit_wrong_action_size_rejected();
 
+    printf("\nOrchard signer / memo+enc_ciphertext verification tests:\n");
+    test_memo_full_consistency_accepted();
+    test_memo_tampered_memo_rejected();
+    test_memo_tampered_rseed_rejected();
+    test_memo_tampered_enc_ciphertext_rejected();
+
     printf("\nOrchard signer / no-blind-signing invariant tests:\n");
     test_verify_refuses_without_any_confirm();
     test_verify_accepts_after_confirm();
@@ -587,6 +851,12 @@ int main(void) {
     test_invalid_action_index();
     test_too_many_actions_rejected_at_meta();
     test_sign_refuses_without_verify();
+
+    printf("\nOrchard signer / fee-confirmation invariant tests:\n");
+    test_verify_refuses_without_fee_confirm();
+    test_confirm_fee_refuses_without_get_fee();
+    test_get_fee_orchard_only_returns_value_balance();
+    test_get_fee_rejects_negative();
 
     printf("\nOrchard signer / transparent-output display tests:\n");
     test_transparent_output_capture_p2pkh();

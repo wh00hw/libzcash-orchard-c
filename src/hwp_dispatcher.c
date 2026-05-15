@@ -214,6 +214,35 @@ static HWP_NOINLINE bool run_per_output_review(HwpDispatcher* d) {
             return false;
         }
     }
+
+    /* Step 3: miner fee. The library refuses to advance verify() past
+     * SIGNER_VERIFIED unless the user has approved the on-device-computed
+     * fee value (no-blind-signing-for-fee invariant). Compute it from
+     * already-collected meta + transparent state, show it on the trusted
+     * screen, and propagate the user's decision to confirm_fee(). */
+    uint64_t fee_zats = 0;
+    OrchardSignerError ferr = orchard_signer_get_fee(d->signer, &fee_zats);
+    if(ferr != SIGNER_OK) {
+        /* FEE_OVERFLOW or FEE_NEGATIVE: the lib has already reset ctx. */
+        return false;
+    }
+    phase(d, HWP_PHASE_REVIEW, (uint16_t)(total + 1), (uint16_t)(total + 1));
+    HwpUiResult fee_r;
+    if(d->ui.review_fee != NULL) {
+        fee_r = d->ui.review_fee(fee_zats, d->user_ctx);
+    } else {
+        /* Backward-compat fallback: render the fee as a synthetic
+         * extra output entry. UI sees idx = total+1 with addr_str =
+         * "Network fee", value = fee_zats. */
+        fee_r = d->ui.review_output(
+            (uint16_t)(total + 1), (uint16_t)(total + 1),
+            "Network fee", fee_zats, d->user_ctx);
+    }
+    if(fee_r != HWP_UI_OK) return false;
+
+    if(orchard_signer_confirm_fee(d->signer) != SIGNER_OK) {
+        return false;
+    }
     return true;
 }
 
@@ -287,36 +316,81 @@ static HWP_NOINLINE bool handle_tx_output(HwpDispatcher* d, HwpFrame* f) {
             return false;
         }
     } else {
-        /* Action data 0..N-1. */
-        HwpActionV4 av4;
-        if(!hwp_parse_action_v4(txo.output_data, txo.output_data_len, &av4)) {
-            send_error(d, f->seq, HWP_ERR_BAD_FRAME,
-                       "Action payload size mismatch");
-            orchard_signer_reset(d->signer);
-            return false;
-        }
+        /* Action data 0..N-1. Discriminate v4 vs v5 by payload size:
+         *   v4 (903 B)  = action(820) + recipient(43) + value(8) + rseed(32)
+         *   v5 (1447 B) = v4 + memo(512) + esk(32)
+         * The v5 path additionally verifies enc_ciphertext + epk on-device,
+         * closing the memo-substitution attack that v4 cmx-only leaves open. */
         phase(d, HWP_PHASE_VERIFY,
               (uint16_t)(txo.output_index + 1), txo.total_outputs);
         if(d->ui.progress) {
             d->ui.progress(0, "Verifying output...", d->user_ctx);
         }
-        serr = orchard_signer_feed_action_with_note(
-            d->signer, av4.action, HWP_ACTION_DATA_SIZE,
-            av4.recipient, av4.value, av4.rseed);
-        if(serr == SIGNER_ERR_NOTE_COMMITMENT_MISMATCH) {
-            send_error(d, f->seq, HWP_ERR_NOTE_COMMITMENT_MISMATCH,
-                       "Action cmx does not commit to claimed recipient/value/rseed");
-            orchard_signer_reset(d->signer);
-            return false;
-        } else if(serr == SIGNER_ERR_TOO_MANY_ACTIONS) {
-            send_error(d, f->seq, HWP_ERR_BAD_FRAME,
-                       "Transaction has more outputs than the device can display");
-            orchard_signer_reset(d->signer);
-            return false;
-        } else if(serr != SIGNER_OK) {
-            send_error(d, f->seq, HWP_ERR_BAD_FRAME, "Bad action data");
-            orchard_signer_reset(d->signer);
-            return false;
+
+        if(txo.output_data_len == HWP_ACTION_DATA_SIZE_V5) {
+            HwpActionV5 av5;
+            if(!hwp_parse_action_v5(txo.output_data, txo.output_data_len, &av5)) {
+                send_error(d, f->seq, HWP_ERR_BAD_FRAME,
+                           "Action v5 payload size mismatch");
+                orchard_signer_reset(d->signer);
+                return false;
+            }
+            serr = orchard_signer_feed_action_with_note_and_memo(
+                d->signer, av5.action, HWP_ACTION_DATA_SIZE,
+                av5.recipient, av5.value, av5.rseed,
+                av5.memo);
+            if(serr == SIGNER_ERR_NOTE_COMMITMENT_MISMATCH) {
+                send_error(d, f->seq, HWP_ERR_NOTE_COMMITMENT_MISMATCH,
+                           "Action cmx does not commit to claimed note");
+                orchard_signer_reset(d->signer);
+                return false;
+            } else if(serr == SIGNER_ERR_MEMO_MISMATCH) {
+                send_error(d, f->seq, HWP_ERR_MEMO_MISMATCH,
+                           "enc_ciphertext does not match recomputed memo/esk");
+                orchard_signer_reset(d->signer);
+                return false;
+            } else if(serr == SIGNER_ERR_BAD_PK_D) {
+                send_error(d, f->seq, HWP_ERR_BAD_PK_D,
+                           "pk_d does not decode to a valid Pallas point");
+                orchard_signer_reset(d->signer);
+                return false;
+            } else if(serr == SIGNER_ERR_TOO_MANY_ACTIONS) {
+                send_error(d, f->seq, HWP_ERR_BAD_FRAME,
+                           "Transaction has more outputs than the device can display");
+                orchard_signer_reset(d->signer);
+                return false;
+            } else if(serr != SIGNER_OK) {
+                send_error(d, f->seq, HWP_ERR_BAD_FRAME, "Bad action v5 data");
+                orchard_signer_reset(d->signer);
+                return false;
+            }
+        } else {
+            /* Backward-compat v4 path. */
+            HwpActionV4 av4;
+            if(!hwp_parse_action_v4(txo.output_data, txo.output_data_len, &av4)) {
+                send_error(d, f->seq, HWP_ERR_BAD_FRAME,
+                           "Action payload size mismatch");
+                orchard_signer_reset(d->signer);
+                return false;
+            }
+            serr = orchard_signer_feed_action_with_note(
+                d->signer, av4.action, HWP_ACTION_DATA_SIZE,
+                av4.recipient, av4.value, av4.rseed);
+            if(serr == SIGNER_ERR_NOTE_COMMITMENT_MISMATCH) {
+                send_error(d, f->seq, HWP_ERR_NOTE_COMMITMENT_MISMATCH,
+                           "Action cmx does not commit to claimed recipient/value/rseed");
+                orchard_signer_reset(d->signer);
+                return false;
+            } else if(serr == SIGNER_ERR_TOO_MANY_ACTIONS) {
+                send_error(d, f->seq, HWP_ERR_BAD_FRAME,
+                           "Transaction has more outputs than the device can display");
+                orchard_signer_reset(d->signer);
+                return false;
+            } else if(serr != SIGNER_OK) {
+                send_error(d, f->seq, HWP_ERR_BAD_FRAME, "Bad action data");
+                orchard_signer_reset(d->signer);
+                return false;
+            }
         }
     }
     return true;

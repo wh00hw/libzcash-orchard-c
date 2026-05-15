@@ -5,6 +5,7 @@
 #include "bignum.h"
 #include "segwit_addr.h"
 #include "memzero.h"
+#include "chacha20poly1305.h"
 #include <string.h>
 
 #include "aes_ct.h"
@@ -974,4 +975,193 @@ void orchard_compute_cmx(
     memzero(msg, sizeof(msg));
     memzero(&rcm_bn, sizeof(rcm_bn));
     memzero(&cmx_bn, sizeof(cmx_bn));
+}
+
+/* ------------------------------------------------------------------ */
+/*  Orchard note encryption verification helpers                       */
+/* ------------------------------------------------------------------ */
+
+/* Decode a Pallas point from its 32-byte repr_P encoding:
+ *   bytes[0..30]              = x_LE
+ *   bytes[31] bits 0..6       = top 7 bits of x_LE
+ *   bytes[31] bit  7          = sign(y) (LSB of y as integer)
+ *
+ * Recovers y by solving y^2 = x^3 + 5 (the Pallas curve equation with
+ * a=0, b=5), then picks the root whose LSB matches the encoded sign bit.
+ *
+ * Returns 0 on success, -1 if no point lies above x (the encoded x has
+ * no square root for x^3 + 5, which means the companion supplied an
+ * invalid pk_d/epk — treated as a hostile or corrupt input).
+ */
+static int pallas_decode_repr_p(pallas_point* out, const uint8_t repr[32]) {
+    uint8_t x_le[32];
+    memcpy(x_le, repr, 32);
+    uint8_t y_sign = (x_le[31] >> 7) & 1u;
+    x_le[31] &= 0x7Fu;
+
+    bignum256 x_bn;
+    bn_read_le(x_le, &x_bn);
+    memzero(x_le, sizeof(x_le));
+
+    /* y^2 = x^3 + 5 */
+    bignum256 y2, t;
+    fp_sqr(&t, &x_bn);                /* x^2 */
+    fp_mul(&y2, &t, &x_bn);           /* x^3 */
+    bignum256 five;
+    bn_read_uint32(5, &five);
+    fp_add(&y2, &y2, &five);          /* y^2 = x^3 + 5 */
+
+    bignum256 y_bn;
+    if (!fp_sqrt(&y_bn, &y2)) {
+        memzero(&x_bn, sizeof(x_bn));
+        memzero(&y2, sizeof(y2));
+        return -1;
+    }
+
+    /* Pick the root matching the encoded sign. */
+    if ((y_bn.val[0] & 1u) != y_sign) {
+        fp_neg(&y_bn, &y_bn);
+    }
+
+    bn_copy(&x_bn, &out->x);
+    bn_copy(&y_bn, &out->y);
+    out->infinity = 0;
+
+    memzero(&x_bn, sizeof(x_bn));
+    memzero(&y_bn, sizeof(y_bn));
+    memzero(&y2, sizeof(y2));
+    memzero(&t, sizeof(t));
+    return 0;
+}
+
+/* Encode a Pallas point to repr_P. */
+static void pallas_encode_repr_p(uint8_t out[32], const pallas_point* p) {
+    bn_write_le(&p->x, out);
+    out[31] &= 0x7Fu;
+    if (p->y.val[0] & 1u) out[31] |= 0x80u;
+}
+
+/* Derive the per-output ephemeral secret key esk from rseed + rho, per
+ * ZIP-212 / Orchard protocol spec §4.7.3:
+ *   esk = ToScalar(PRF^expand(rseed, [0x04] || rho))
+ *
+ * Exposed as a static helper so both the public esk-aware API and the
+ * derive-internally API share one implementation.
+ */
+static void orchard_derive_esk_from_rseed(
+    const uint8_t rseed[32],
+    const uint8_t rho[32],
+    uint8_t esk_out[32])
+{
+    uint8_t prf_in[1 + 32];
+    uint8_t prf_out[64];
+    prf_in[0] = 0x04;
+    memcpy(prf_in + 1, rho, 32);
+    prf_expand(rseed, prf_in, sizeof(prf_in), prf_out);
+    to_scalar(prf_out, esk_out);
+    memzero(prf_in, sizeof(prf_in));
+    memzero(prf_out, sizeof(prf_out));
+}
+
+int orchard_compute_enc_ciphertext_from_rseed(
+    const uint8_t d[11],
+    const uint8_t pk_d[32],
+    uint64_t value,
+    const uint8_t rseed[32],
+    const uint8_t rho[32],
+    const uint8_t memo[512],
+    uint8_t enc_ciphertext_out[580],
+    uint8_t epk_out[32])
+{
+    uint8_t esk[32];
+    orchard_derive_esk_from_rseed(rseed, rho, esk);
+    int rc = orchard_compute_enc_ciphertext(d, pk_d, value, rseed, memo, esk,
+                                             enc_ciphertext_out, epk_out);
+    memzero(esk, sizeof(esk));
+    return rc;
+}
+
+int orchard_compute_enc_ciphertext(
+    const uint8_t d[11],
+    const uint8_t pk_d[32],
+    uint64_t value,
+    const uint8_t rseed[32],
+    const uint8_t memo[512],
+    const uint8_t esk[32],
+    uint8_t enc_ciphertext_out[580],
+    uint8_t epk_out[32])
+{
+    /* 1. g_d = DiversifyHash(d). Same hash-to-curve used by cmx. */
+    pallas_point g_d;
+    pallas_hash_to_curve(&g_d, "z.cash:Orchard-gd", d, 11);
+
+    /* 2. esk as Pallas scalar (the companion-supplied 32 bytes are
+     *    treated verbatim, mod q; pallas_point_mul handles reduction). */
+    bignum256 esk_bn;
+    bn_read_le(esk, &esk_bn);
+
+    /* 3. epk = [esk]·g_d, encoded as repr_P. */
+    pallas_point epk;
+    pallas_point_mul(&epk, &esk_bn, &g_d);
+    uint8_t epk_bytes[32];
+    pallas_encode_repr_p(epk_bytes, &epk);
+    if (epk_out) memcpy(epk_out, epk_bytes, 32);
+
+    /* 4. SharedSecret = [esk]·pk_d. */
+    pallas_point pk_d_pt;
+    if (pallas_decode_repr_p(&pk_d_pt, pk_d) != 0) {
+        memzero(&g_d, sizeof(g_d));
+        memzero(&epk, sizeof(epk));
+        memzero(&esk_bn, sizeof(esk_bn));
+        memzero(epk_bytes, sizeof(epk_bytes));
+        return -1;
+    }
+    pallas_point ss;
+    pallas_point_mul(&ss, &esk_bn, &pk_d_pt);
+    uint8_t ss_bytes[32];
+    pallas_encode_repr_p(ss_bytes, &ss);
+
+    /* 5. K_enc = BLAKE2b-256("Zcash_OrchardKDF", epk_bytes || ss_bytes).
+     *    Matches Zcash protocol spec §5.4.4.6 / §4.20. */
+    uint8_t k_enc[32];
+    {
+        blake2b_state h;
+        blake2b_InitPersonal(&h, 32, "Zcash_OrchardKDF", 16);
+        blake2b_Update(&h, epk_bytes, 32);
+        blake2b_Update(&h, ss_bytes, 32);
+        blake2b_Final(&h, k_enc, 32);
+    }
+
+    /* 6. Note plaintext (564 bytes):
+     *   leadByte(0x02) || d(11) || value_LE(8) || rseed(32) || memo(512) */
+    uint8_t np[564];
+    np[0] = 0x02;
+    memcpy(np + 1, d, 11);
+    for (int i = 0; i < 8; i++) {
+        np[12 + i] = (uint8_t)((value >> (8 * i)) & 0xFFu);
+    }
+    memcpy(np + 20, rseed, 32);
+    memcpy(np + 52, memo, 512);
+
+    /* 7. enc_ciphertext = ChaCha20-Poly1305_Encrypt(K_enc, nonce=0, np)
+     *    The 16-byte tag is appended after the 564-byte ciphertext for a
+     *    total of 580 bytes, matching the layout the on-chain action uses. */
+    static const uint8_t zero_nonce[12] = {0};
+    chacha20poly1305_encrypt(
+        k_enc, zero_nonce,
+        NULL, 0,
+        np, 564,
+        enc_ciphertext_out,
+        enc_ciphertext_out + 564);
+
+    memzero(np, sizeof(np));
+    memzero(k_enc, sizeof(k_enc));
+    memzero(epk_bytes, sizeof(epk_bytes));
+    memzero(ss_bytes, sizeof(ss_bytes));
+    memzero(&epk, sizeof(epk));
+    memzero(&ss, sizeof(ss));
+    memzero(&g_d, sizeof(g_d));
+    memzero(&pk_d_pt, sizeof(pk_d_pt));
+    memzero(&esk_bn, sizeof(esk_bn));
+    return 0;
 }

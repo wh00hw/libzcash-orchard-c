@@ -27,6 +27,7 @@ add_library(zcash-orchard-c-deterministic STATIC
     ${CMAKE_SOURCE_DIR}/src/hash_stubs.c
     ${CMAKE_SOURCE_DIR}/src/aes/aes_ct.c
     ${CMAKE_SOURCE_DIR}/src/aead.c
+    ${CMAKE_SOURCE_DIR}/src/chacha20poly1305.c
     ${CMAKE_SOURCE_DIR}/src/wallet_lockout.c
     ${CMAKE_SOURCE_DIR}/src/hwp.c
     ${CMAKE_SOURCE_DIR}/src/zip244.c
@@ -43,6 +44,12 @@ target_compile_definitions(zcash-orchard-c-deterministic PRIVATE
     USE_PLATFORM_RNG=0
     ZORCHARD_INSECURE_LCG=1
 )
+# Tests rely on assert() as the failure-detection mechanism; force it on
+# regardless of the build type. Without this, Release builds (-DNDEBUG)
+# silently turn every assert into a no-op and a broken invariant looks
+# identical to a passing test (we hit this in the fee-gate review pass:
+# tests "passed" only because asserts were compiled out).
+target_compile_options(zcash-orchard-c-deterministic PRIVATE -UNDEBUG)
 target_compile_options(zcash-orchard-c-deterministic PRIVATE -Wall -Wextra -Wno-unused-parameter)
 
 # All four tests link against the deterministic variant. Tests that don't
@@ -59,6 +66,7 @@ add_test(NAME test_orchard COMMAND test_orchard)
 add_executable(test_signer test_signer.c)
 target_link_libraries(test_signer PRIVATE zcash-orchard-c-deterministic)
 target_include_directories(test_signer PRIVATE ${CMAKE_SOURCE_DIR}/tests)
+target_compile_options(test_signer PRIVATE -UNDEBUG)
 add_test(NAME test_signer COMMAND test_signer)
 
 add_executable(test_vectors test_vectors.c)

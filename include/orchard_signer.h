@@ -81,6 +81,46 @@ typedef enum {
     SIGNER_ERR_INVALID_ACTION_INDEX,     /* confirm/get on out-of-range index */
     SIGNER_ERR_ACTION_NOT_CONFIRMED,     /* verify() called before user confirmed
                                             every output's recipient/value */
+    SIGNER_ERR_FEE_NOT_CONFIRMED,        /* verify() called before user confirmed
+                                            the computed miner fee. Mirrors the
+                                            no-blind-signing invariant for the
+                                            fee — a hostile companion that
+                                            shows "fee 0.0001 ZEC" on its own UI
+                                            but sets value_balance much higher
+                                            would silently pay the surplus to
+                                            miners. */
+    SIGNER_ERR_FEE_OVERFLOW,             /* arithmetic overflow when summing
+                                            transparent values or computing
+                                            t_in - t_out + value_balance. The
+                                            companion has supplied values that
+                                            overflow the 21M-ZEC monetary cap
+                                            or arranged them so the signed fee
+                                            is outside i64 range. Treated as a
+                                            hostile input — the session is
+                                            reset. */
+    SIGNER_ERR_FEE_NEGATIVE,             /* computed fee is negative
+                                            (t_in + value_balance < t_out).
+                                            Negative fees are not valid in
+                                            Zcash consensus; a negative result
+                                            means the companion assembled an
+                                            unbalanced bundle. The session is
+                                            reset. */
+    SIGNER_ERR_MEMO_MISMATCH,            /* device-recomputed enc_ciphertext
+                                            (from companion-supplied memo +
+                                            esk + note plaintext) does not
+                                            match the action's on-chain
+                                            enc_ciphertext field. A hostile
+                                            companion is showing one memo to
+                                            the user while embedding another
+                                            in the action — closes the gap
+                                            the cmx recomputation leaves open
+                                            (cmx binds value/recipient but
+                                            not memo bytes). The session is
+                                            reset. */
+    SIGNER_ERR_BAD_PK_D,                 /* companion-supplied pk_d does not
+                                            decode to a valid Pallas point
+                                            (x^3 + 5 is a non-square mod p).
+                                            Structurally invalid input. */
 } OrchardSignerError;
 
 /**
@@ -141,6 +181,16 @@ typedef struct {
      *  them) but cannot be displayed — feed_transparent_output()
      *  returns SIGNER_ERR_TOO_MANY_ACTIONS to surface the limit. */
     TransparentOutputDisplay t_outputs_display[ORCHARD_SIGNER_MAX_T_OUTPUTS];
+    /** Computed miner fee (zatoshis) cached after orchard_signer_get_fee()
+     *  was first called, and the flag set when the user has confirmed it via
+     *  orchard_signer_confirm_fee(). orchard_signer_verify() refuses to
+     *  advance to SIGNER_VERIFIED unless fee_confirmed == true — the
+     *  no-blind-signing invariant extended to the fee number itself, so a
+     *  hostile companion that inflates value_balance behind a misleading
+     *  fee on its own UI cannot extract a signature. */
+    uint64_t fee_zatoshis;
+    bool fee_computed;
+    bool fee_confirmed;
 } OrchardSignerCtx;
 
 /**
@@ -207,6 +257,80 @@ OrchardSignerError orchard_signer_feed_action_with_note(
     const uint8_t recipient[43],
     uint64_t value,
     const uint8_t rseed[32]);
+
+/**
+ * Feed one action together with the FULL note plaintext (including the
+ * 512-byte memo and the 32-byte ephemeral secret `esk`), and verify both
+ * the cmx and the enc_ciphertext on-device.
+ *
+ * This is the stronger variant of feed_action_with_note(). The cmx check
+ * binds (d, pk_d, value, rho, rseed) but is silent about the memo bytes:
+ * a hostile companion that has been forced through cmx-recomputation can
+ * still display "invoice #123" on its untrusted UI while putting an
+ * arbitrary attacker-chosen memo inside enc_ciphertext (the memo is
+ * inside the encrypted note plaintext that goes to the recipient).
+ *
+ * On-device defence:
+ *   1. Recompute the note commitment cmx as in feed_action_with_note();
+ *      mismatch → SIGNER_ERR_NOTE_COMMITMENT_MISMATCH, session reset.
+ *   2. Recompute the 580-byte enc_ciphertext via:
+ *        epk          = [esk]·g_d
+ *        SharedSecret = [esk]·pk_d
+ *        K_enc        = BLAKE2b("Zcash_OrchardKDF", repr_P(epk)||repr_P(ss))
+ *        np           = leadByte(0x02)||d||value_LE||rseed||memo  (564 B)
+ *        enc_ciphertext = ChaCha20-Poly1305_Encrypt(K_enc, IV=0, np)
+ *      and constant-time compare against the action's enc_ciphertext
+ *      field (offset 160, 580 B). Mismatch → SIGNER_ERR_MEMO_MISMATCH,
+ *      session reset.
+ *   3. Verify the action's `ephemeral_key` field (offset 128, 32 B)
+ *      matches the recomputed epk. Mismatch → SIGNER_ERR_MEMO_MISMATCH
+ *      (same code, since both are companion-claimed values that bind to
+ *      the on-chain action and don't pass the recompute check).
+ *   4. On success, hash the action into the sighash state and capture
+ *      (recipient, value) for the per-action display loop.
+ *
+ * Behavioural compatibility: callers that only need cmx-binding can keep
+ * using feed_action_with_note(); this stronger variant is the one a
+ * companion-treats-as-untrusted-period device should use.
+ *
+ * Returns SIGNER_OK on success, or one of:
+ *   SIGNER_ERR_BAD_ACTION                action_data invalid / wrong size
+ *   SIGNER_ERR_BAD_PK_D                  pk_d does not decode to a valid
+ *                                        Pallas point
+ *   SIGNER_ERR_NOTE_COMMITMENT_MISMATCH  cmx does not commit to the
+ *                                        claimed (d, pk_d, value, rseed)
+ *   SIGNER_ERR_MEMO_MISMATCH             enc_ciphertext (and/or epk) does
+ *                                        not match what the device
+ *                                        recomputed from the supplied
+ *                                        memo + esk
+ *
+ * On any mismatch error the context is reset to IDLE so a partial
+ * session cannot be reused.
+ *
+ * @param ctx          Signing context (must be in RECEIVING_ACTIONS)
+ * @param action_data  Raw action bytes (820)
+ * @param action_len   Length of action_data (must equal 820)
+ * @param recipient    43 bytes = d[11] || pk_d[32]
+ * @param value        Output note value in zatoshis
+ * @param rseed        32-byte note rseed
+ * @param memo         512-byte memo plaintext (ZIP-302 conventions; the
+ *                     leading byte signals memo type, but on-device the
+ *                     bytes are opaque — the user-visible rendering is
+ *                     the firmware's responsibility)
+ *
+ * The ephemeral secret `esk` is NOT taken as input: per ZIP-212 it is a
+ * deterministic function of `rseed` and the action's nullifier
+ * (= rho), so the device derives it on-chip from the same inputs the
+ * companion already supplies. This keeps esk off the wire (32 bytes
+ * less per action) and removes one trust-from-companion vector.
+ */
+OrchardSignerError orchard_signer_feed_action_with_note_and_memo(
+    OrchardSignerCtx *ctx,
+    const uint8_t *action_data, size_t action_len,
+    const uint8_t recipient[43],
+    uint64_t value,
+    const uint8_t rseed[32],
+    const uint8_t memo[512]);
 
 /**
  * Read out the (recipient, value) the firmware needs to display for a
@@ -338,6 +462,52 @@ OrchardSignerError orchard_signer_get_transparent_output_display(
  */
 OrchardSignerError orchard_signer_verify_transparent(OrchardSignerCtx *ctx,
                                                       const uint8_t expected_digest[32]);
+
+/**
+ * Compute (or retrieve cached) the miner fee in zatoshis that this
+ * transaction will pay, derived from already-collected data:
+ *
+ *   fee = transparent_in_total - transparent_out_total + value_balance
+ *
+ * For an Orchard-only transaction with no transparent flow, this reduces
+ * to `fee = value_balance` (value flowing out of the Orchard pool == fee
+ * paid to miners, since there is no transparent pool to absorb it).
+ *
+ * Prerequisites (caller MUST satisfy):
+ *   - feed_meta() has been called (value_balance available)
+ *   - if the tx has transparent components, every transparent input AND
+ *     output has been streamed via feed_transparent_input/output(), so
+ *     t_in_total / t_out_total reflect the full bundle.
+ *
+ * Errors:
+ *   - SIGNER_ERR_BAD_STATE     prerequisites not met
+ *   - SIGNER_ERR_FEE_OVERFLOW  unsigned add overflow on t_in / t_out,
+ *                              or i64 overflow combining the three terms
+ *   - SIGNER_ERR_FEE_NEGATIVE  fee < 0 (companion built an unbalanced bundle)
+ *
+ * On success the fee is cached in ctx->fee_zatoshis and ctx->fee_computed
+ * is set; subsequent calls return the same value without recomputation.
+ *
+ * @param ctx       Signing context
+ * @param fee_out   Output: miner fee in zatoshis (uint64)
+ */
+OrchardSignerError orchard_signer_get_fee(OrchardSignerCtx *ctx,
+                                           uint64_t *fee_out);
+
+/**
+ * Mark the computed fee as confirmed by the user.
+ *
+ * The firmware MUST display the value returned by orchard_signer_get_fee()
+ * on the trusted device screen and call this only after the user explicitly
+ * approves it. Without confirmation, orchard_signer_verify() refuses to
+ * transition to SIGNER_VERIFIED (SIGNER_ERR_FEE_NOT_CONFIRMED).
+ *
+ * Confirmation is monotonic: re-calling on an already-confirmed context is
+ * a no-op. To revoke, call orchard_signer_reset().
+ *
+ * @param ctx  Signing context (must have fee_computed == true)
+ */
+OrchardSignerError orchard_signer_confirm_fee(OrchardSignerCtx *ctx);
 
 /**
  * Feed the expected sighash (sentinel message) and verify.

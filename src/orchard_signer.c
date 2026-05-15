@@ -5,6 +5,7 @@
 #include "redpallas.h"
 #include "orchard.h"
 #include "memzero.h"
+#include <stdint.h>
 #include <string.h>
 
 void orchard_signer_init(OrchardSignerCtx *ctx)
@@ -254,6 +255,9 @@ OrchardSignerError orchard_signer_feed_action(OrchardSignerCtx *ctx,
  */
 #define ORCHARD_ACTION_OFFSET_NULLIFIER 32
 #define ORCHARD_ACTION_OFFSET_CMX       96
+#define ORCHARD_ACTION_OFFSET_EPK       128
+#define ORCHARD_ACTION_OFFSET_ENC       160
+#define ORCHARD_ACTION_ENC_SIZE         580
 #define ORCHARD_ACTION_TOTAL_SIZE       820
 
 OrchardSignerError orchard_signer_feed_action_with_note(
@@ -316,6 +320,90 @@ OrchardSignerError orchard_signer_feed_action_with_note(
     return SIGNER_OK;
 }
 
+OrchardSignerError orchard_signer_feed_action_with_note_and_memo(
+    OrchardSignerCtx *ctx,
+    const uint8_t *action_data, size_t action_len,
+    const uint8_t recipient[43],
+    uint64_t value,
+    const uint8_t rseed[32],
+    const uint8_t memo[512])
+{
+    if (ctx->state != SIGNER_RECEIVING_ACTIONS) {
+        return SIGNER_ERR_BAD_STATE;
+    }
+    if (ctx->actions_received >= ctx->actions_expected) {
+        return SIGNER_ERR_BAD_STATE;
+    }
+    if (ctx->actions_received >= ORCHARD_SIGNER_MAX_ACTIONS) {
+        orchard_signer_reset(ctx);
+        return SIGNER_ERR_TOO_MANY_ACTIONS;
+    }
+    if (action_len != ORCHARD_ACTION_TOTAL_SIZE) {
+        return SIGNER_ERR_BAD_ACTION;
+    }
+
+    const uint8_t *d         = recipient;          /* 11 bytes */
+    const uint8_t *pk_d      = recipient + 11;     /* 32 bytes */
+    const uint8_t *rho       = action_data + ORCHARD_ACTION_OFFSET_NULLIFIER;
+    const uint8_t *action_cmx = action_data + ORCHARD_ACTION_OFFSET_CMX;
+    const uint8_t *action_epk = action_data + ORCHARD_ACTION_OFFSET_EPK;
+    const uint8_t *action_enc = action_data + ORCHARD_ACTION_OFFSET_ENC;
+
+    /* Step 1: cmx recomputation — same as feed_action_with_note(). */
+    uint8_t computed_cmx[32];
+    orchard_compute_cmx(d, pk_d, value, rho, rseed, computed_cmx);
+    if (!ct_memequal(computed_cmx, action_cmx, 32)) {
+        memzero(computed_cmx, sizeof(computed_cmx));
+        orchard_signer_reset(ctx);
+        return SIGNER_ERR_NOTE_COMMITMENT_MISMATCH;
+    }
+    memzero(computed_cmx, sizeof(computed_cmx));
+
+    /* Step 2: recompute enc_ciphertext from (recipient, value, rseed, memo)
+     * and cross-check both ciphertext + epk against the action bytes. esk
+     * is derived internally from rseed + rho per ZIP-212. Closes the
+     * memo-substitution gap that cmx alone leaves open. */
+    uint8_t computed_enc[ORCHARD_ACTION_ENC_SIZE];
+    uint8_t computed_epk[32];
+    int rc = orchard_compute_enc_ciphertext_from_rseed(
+        d, pk_d, value, rseed, rho, memo,
+        computed_enc, computed_epk);
+    if (rc != 0) {
+        /* pk_d is not a valid Pallas point. */
+        memzero(computed_enc, sizeof(computed_enc));
+        memzero(computed_epk, sizeof(computed_epk));
+        orchard_signer_reset(ctx);
+        return SIGNER_ERR_BAD_PK_D;
+    }
+
+    /* Both checks must pass before we commit anything to the action stream.
+     * OR-accumulate the two equality results so the timing profile reveals
+     * only "both matched" vs "at least one didn't" — a sender that knows
+     * which of the two diverged could infer something about device state. */
+    int enc_ok = (int)ct_memequal(computed_enc, action_enc, ORCHARD_ACTION_ENC_SIZE);
+    int epk_ok = (int)ct_memequal(computed_epk, action_epk, 32);
+    memzero(computed_enc, sizeof(computed_enc));
+    memzero(computed_epk, sizeof(computed_epk));
+    if (!(enc_ok & epk_ok)) {
+        orchard_signer_reset(ctx);
+        return SIGNER_ERR_MEMO_MISMATCH;
+    }
+
+    /* All recomputations verified: feed the action through the normal hash path. */
+    if (!zip244_hash_action(&ctx->actions_state, action_data, action_len)) {
+        return SIGNER_ERR_BAD_ACTION;
+    }
+
+    /* Capture display info, identical to feed_action_with_note. */
+    OrchardActionDisplay *disp = &ctx->actions_display[ctx->actions_received];
+    memcpy(disp->recipient, recipient, 43);
+    disp->value = value;
+    disp->confirmed = false;
+
+    ctx->actions_received++;
+    return SIGNER_OK;
+}
+
 OrchardSignerError orchard_signer_get_action_display(
     const OrchardSignerCtx *ctx,
     uint16_t idx,
@@ -359,6 +447,86 @@ bool orchard_signer_recipient_matches_any(
     return any_match != 0;
 }
 
+OrchardSignerError orchard_signer_get_fee(OrchardSignerCtx *ctx,
+                                           uint64_t *fee_out)
+{
+    if (!ctx->has_meta) {
+        return SIGNER_ERR_BAD_STATE;
+    }
+
+    /* If the transaction declared transparent components, the caller must
+     * have streamed all of them before we can compute the fee — otherwise
+     * t_in_total / t_out_total are partial sums. */
+    if (ctx->transparent_inputs_expected > 0 || ctx->transparent_outputs_expected > 0) {
+        if (ctx->transparent_state.inputs_received != ctx->transparent_inputs_expected ||
+            ctx->transparent_state.outputs_received != ctx->transparent_outputs_expected) {
+            return SIGNER_ERR_BAD_STATE;
+        }
+        if (ctx->transparent_state.t_in_overflow || ctx->transparent_state.t_out_overflow) {
+            orchard_signer_reset(ctx);
+            return SIGNER_ERR_FEE_OVERFLOW;
+        }
+    }
+
+    if (ctx->fee_computed) {
+        if (fee_out) *fee_out = ctx->fee_zatoshis;
+        return SIGNER_OK;
+    }
+
+    /* fee = t_in - t_out + value_balance  (all in zatoshis)
+     *
+     * Each term has a 21M·10^8 = 2.1·10^15 cap on a valid Zcash tx, well
+     * inside i64. We still cross-check at each step because the companion
+     * controls these inputs and a deliberately malformed bundle could try
+     * to produce wraparound. */
+    uint64_t t_in  = ctx->transparent_state.t_in_total;
+    uint64_t t_out = ctx->transparent_state.t_out_total;
+    int64_t  vb    = ctx->tx_meta.value_balance;
+
+    if (t_in  > (uint64_t)INT64_MAX) { orchard_signer_reset(ctx); return SIGNER_ERR_FEE_OVERFLOW; }
+    if (t_out > (uint64_t)INT64_MAX) { orchard_signer_reset(ctx); return SIGNER_ERR_FEE_OVERFLOW; }
+
+    int64_t t_in_i  = (int64_t)t_in;
+    int64_t t_out_i = (int64_t)t_out;
+    int64_t net_transparent = t_in_i - t_out_i;  /* both non-negative i64 */
+
+    int64_t fee_signed;
+    if (vb > 0) {
+        if (net_transparent > INT64_MAX - vb) {
+            orchard_signer_reset(ctx);
+            return SIGNER_ERR_FEE_OVERFLOW;
+        }
+    } else if (vb < 0) {
+        if (net_transparent < INT64_MIN - vb) {
+            orchard_signer_reset(ctx);
+            return SIGNER_ERR_FEE_OVERFLOW;
+        }
+    }
+    fee_signed = net_transparent + vb;
+
+    if (fee_signed < 0) {
+        orchard_signer_reset(ctx);
+        return SIGNER_ERR_FEE_NEGATIVE;
+    }
+
+    ctx->fee_zatoshis = (uint64_t)fee_signed;
+    ctx->fee_computed = true;
+    if (fee_out) *fee_out = ctx->fee_zatoshis;
+    return SIGNER_OK;
+}
+
+OrchardSignerError orchard_signer_confirm_fee(OrchardSignerCtx *ctx)
+{
+    if (!ctx->fee_computed) {
+        /* Firmware must call get_fee() first, then display the value, then
+         * confirm. Confirming without computing would be confirming a stale
+         * zero — refuse so a buggy UI can't silently approve nothing. */
+        return SIGNER_ERR_BAD_STATE;
+    }
+    ctx->fee_confirmed = true;
+    return SIGNER_OK;
+}
+
 OrchardSignerError orchard_signer_verify(OrchardSignerCtx *ctx,
                                           const uint8_t expected_sighash[32])
 {
@@ -385,6 +553,15 @@ OrchardSignerError orchard_signer_verify(OrchardSignerCtx *ctx,
         if (!ctx->actions_display[i].confirmed) {
             return SIGNER_ERR_ACTION_NOT_CONFIRMED;
         }
+    }
+
+    /* Same invariant extended to the miner fee: even if every output
+     * recipient and value was confirmed, a hostile companion can inflate
+     * value_balance (and lie about the fee on its own UI) to pay the
+     * surplus to miners. The fee number must be computed on-device and
+     * explicitly approved by the user before signing can proceed. */
+    if (!ctx->fee_confirmed) {
+        return SIGNER_ERR_FEE_NOT_CONFIRMED;
     }
 
     /* Orchard-only-with-no-transparent invariant. The sighash mixes in
