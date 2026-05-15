@@ -17,14 +17,16 @@ Implements key derivation, address generation, RedPallas signing, ECDSA transpar
 - **Transparent digest verification** — device independently computes the transparent txid digest from raw inputs/outputs, preventing a compromised companion from forging the transparent digest
 - **Sapling-component lockout** — Orchard-only invariant: `sapling_digest` enforced equal to the ZIP-244 empty-bundle constant on `TxMeta` receipt; any non-empty Sapling bundle aborts the session before action streaming
 - **NoteCommitment (cmx) recomputation** — for every Orchard action, the device recomputes `cmx = Extract_P(NoteCommit(g_d, pk_d, v, ρ, ψ))` from the unencrypted note plaintext (recipient, value, rseed) the companion claims, and rejects the action if the recomputed cmx does not match the cmx field in the encrypted action bytes — closes the recipient-substitution attack a hostile companion would otherwise mount inside the Orchard bundle
+- **`enc_ciphertext` recomputation (memo binding)** — cmx binds value and recipient but is silent about the 512-byte memo. For every Orchard action the device additionally recomputes `enc_ciphertext = ChaCha20-Poly1305(K_enc, IV=0, leadByte ‖ d ‖ value_LE ‖ rseed ‖ memo)` with `K_enc = BLAKE2b("Zcash_OrchardKDF", repr_P(epk) ‖ repr_P([esk]·pk_d))` and `esk = ToScalar(PRF^expand(rseed, [0x04] ‖ ρ))` derived on-chip (ZIP-212), and constant-time-compares it byte-for-byte against the action's `enc_ciphertext` and `ephemeral_key` fields. Closes the memo-substitution attack where a hostile companion would show "invoice #123" on its UI while embedding any arbitrary memo on chain. Sent via the HWP v5 payload (memo + note plaintext, esk derived on-device).
 - **Per-action user confirmation invariant** — `orchard_signer_verify()` refuses to advance to `SIGNER_VERIFIED` unless every captured action has been explicitly confirmed via `orchard_signer_confirm_action()`. Combined with the existing `sign()` precondition (`state == VERIFIED`), this enforces "no blind signing" at library level: a hostile firmware that skips the per-output user-confirmation UI cannot extract a signature
+- **Miner-fee confirmation invariant** — the same no-blind-signing rule extended to the fee itself. The device computes `fee = transparent_in − transparent_out + value_balance` on-chip (with overflow + negative detection), exposes it via `orchard_signer_get_fee()`, and refuses to advance `verify()` until the user has approved it through `orchard_signer_confirm_fee()`. Without this, a hostile companion that inflates `value_balance` could silently siphon the surplus to miners while showing a small fee on its untrusted UI.
 - **Unified Address encoding from arbitrary recipients** — `orchard_encode_ua_raw(d, pk_d, hrp)` produces the canonical ZIP-316 Bech32m string for an Orchard payment address that is *not* the device's own — needed to render the recipient of every output to the user before they confirm
-- **Signing context** (`orchard_signer.h`) — library-level state machine that composes all of the above: a signature is only producible after sapling-empty + per-action cmx + per-action user confirmation + sighash match all pass
-- **Hardware Wallet Protocol v2/v3/v4** — framed binary serial protocol with CRC-16, incremental sighash verification, transparent digest verification, transparent ECDSA signing, compatible with [zcash-hw-wallet-sdk](https://github.com/wh00hw/zcash-hw-wallet-sdk) (Rust)
+- **Signing context** (`orchard_signer.h`) — library-level state machine that composes all of the above: a signature is only producible after sapling-empty + per-action cmx + per-action enc_ciphertext + per-action user confirmation + per-tx fee confirmation + sighash match all pass
+- **Hardware Wallet Protocol v2/v3/v4/v5** — framed binary serial protocol with CRC-16, incremental sighash verification, transparent digest verification, transparent ECDSA signing, and v5 memo-verifying action payload (1415 B = action ‖ recipient ‖ value ‖ rseed ‖ memo; `HWP_MAX_PAYLOAD` bumped 1024 → 2048). Compatible with [zcash-hw-wallet-sdk](https://github.com/wh00hw/zcash-hw-wallet-sdk) (Rust); v4 payloads (903 B, cmx-only) still accepted for backward compatibility when memo recovery is not available on the host side.
 - **Target-agnostic protocol dispatcher** (`hwp_dispatcher.h`) — the entire device-side state machine (drain → parse → switch → reply, PING/PONG keepalive, IDLE detection, multi-frame drain handling, per-output review orchestration, recipient binding) is contained in the library and exposed through a callback-based API. A new device target wires up six I/O callbacks (`serial_drain`, `serial_send`, `get_tick_ms`, `sleep_ms`, `should_exit`, plus UI callbacks for review/confirm) and gets the full protocol implementation for free. The same code runs on FlipZcash, the virtual-device test fixture, and future ESP32 / BOLOS ports — fix once, benefit everywhere.
 - **Transparent t-address rendering on-device** (`base58.h`) — `script_to_taddr()` decodes a P2PKH or P2SH `script_pubkey` to the corresponding Zcash t-address string (mainnet `t1`/`t3`, testnet `tm`/`t2`) via Base58Check encoding. Lets the device display the actual destination of a transparent output (e.g. on a shielded → t-addr sweep) instead of only the change Orchard receivers, extending the no-blind-signing invariant to transparent recipients.
 - **BIP39 mnemonic** — generation and seed derivation (PBKDF2-HMAC-SHA512) with an optional progress callback (`pbkdf2_set_progress_cb`) so the UI can drive a bar during multi-second PIN-derived KDF.
-- **Crypto primitives** — BLAKE2b, SHA-256/512, HMAC, PBKDF2, AES-256 (FF1), all in pure C
+- **Crypto primitives** — BLAKE2b, SHA-256/512, HMAC, PBKDF2, AES-256 (FF1), ChaCha20-Poly1305 (RFC 7539, used for Orchard note encryption verification), all in pure C
 - **Platform-agnostic** — pluggable RNG, optional Sinsemilla table acceleration, portable compiler abstractions
 
 ## Target platforms
@@ -251,26 +253,28 @@ if (r == HWP_FEED_FRAME_READY) {
 
 ```
 include/
-  platform.h       — Compiler/platform abstraction (CLZ, packing, alignment)
-  options.h        — Build-time feature flags
-  orchard.h        — Key derivation, address generation, F4Jumble
-  redpallas.h      — RedPallas spend authorization signing (Orchard)
-  secp256k1.h      — secp256k1 curve + ECDSA signing + RFC 6979 (Transparent)
-  bip32.h          — BIP-32 transparent HD key derivation (HMAC-SHA512)
-  pallas.h         — Pallas curve arithmetic, Sinsemilla hash
-  hwp.h            — Hardware Wallet Protocol v2/v3/v4 (serial framing)
-  hwp_dispatcher.h — Device-side protocol driver (callback-based, target-agnostic)
-  zip244.h         — ZIP-244 v5 sighash (shielded + transparent per-input)
-  orchard_signer.h — Signing context with mandatory sighash verification
-  base58.h         — Base58Check + transparent script_pubkey → t-address rendering
-  bip39.h          — BIP39 mnemonic generation
-  bignum.h         — 256-bit big number arithmetic
-  blake2b.h        — BLAKE2b hash
-  sha2.h           — SHA-256 / SHA-512
-  hmac.h           — HMAC-SHA-256 / HMAC-SHA-512
-  pbkdf2.h         — PBKDF2-HMAC-SHA-512
-  rand.h           — RNG abstraction (pluggable backend)
-  segwit_addr.h    — Bech32 / Bech32m encoding
+  platform.h            — Compiler/platform abstraction (CLZ, packing, alignment)
+  options.h             — Build-time feature flags
+  orchard.h             — Key derivation, address generation, F4Jumble, NoteCommit + enc_ciphertext recomputation
+  redpallas.h           — RedPallas spend authorization signing (Orchard)
+  secp256k1.h           — secp256k1 curve + ECDSA signing + RFC 6979 (Transparent)
+  bip32.h               — BIP-32 transparent HD key derivation (HMAC-SHA512)
+  pallas.h              — Pallas curve arithmetic, Sinsemilla hash
+  hwp.h                 — Hardware Wallet Protocol v2/v3/v4/v5 (serial framing, memo-verifying action payload)
+  hwp_dispatcher.h      — Device-side protocol driver (callback-based, target-agnostic)
+  zip244.h              — ZIP-244 v5 sighash (shielded + transparent per-input)
+  orchard_signer.h      — Signing context with mandatory sighash + cmx + memo + fee verification
+  chacha20poly1305.h    — ChaCha20-Poly1305 AEAD (RFC 7539), used for on-device Orchard note encryption verification
+  aead.h                — AES-256-CTR + HMAC-SHA256 AEAD (used for PIN-sealed wallet storage)
+  base58.h              — Base58Check + transparent script_pubkey → t-address rendering
+  bip39.h               — BIP39 mnemonic generation
+  bignum.h              — 256-bit big number arithmetic
+  blake2b.h             — BLAKE2b hash
+  sha2.h                — SHA-256 / SHA-512
+  hmac.h                — HMAC-SHA-256 / HMAC-SHA-512
+  pbkdf2.h              — PBKDF2-HMAC-SHA-512
+  rand.h                — RNG abstraction (pluggable backend)
+  segwit_addr.h         — Bech32 / Bech32m encoding
 
 src/
   aes/             — AES-256 (pure C, no hardware intrinsics)
@@ -286,9 +290,9 @@ src/
 | `pallas_set_progress_cb()` | Runtime callback | UI progress during key derivation |
 | `pallas_set_yield_cb()` | Runtime callback | Watchdog / RTOS yield |
 
-## On-Device Verification — three composed invariants
+## On-Device Verification — five composed invariants
 
-`orchard_signer.h` enforces three checkpoints, in order, before any RedPallas signature is produced. Each is a library-level state-machine invariant: a hostile firmware cannot extract a signature by skipping any of them.
+`orchard_signer.h` enforces five checkpoints, in order, before any RedPallas signature is produced. Each is a library-level state-machine invariant: a hostile firmware cannot extract a signature by skipping any of them, and no component of the ZIP-244 sighash or of any output note is taken on faith from the companion.
 
 ### 1. ZIP-244 sighash recomputed on-device
 
@@ -319,7 +323,29 @@ cmx_computed = Extract_P(SinsemillaCommit("z.cash:Orchard-NoteCommit",
 
 with `rho` taken from the action's nullifier field (Orchard's split-action design) and constant-time-compares `cmx_computed` against the cmx field at offset 96 of the action bytes. Mismatch → `SIGNER_ERR_NOTE_COMMITMENT_MISMATCH`, context reset, no further action data hashed. Closes recipient substitution; an attacker would have to break Sinsemilla.
 
-### 3. Per-action user confirmation (no blind signing)
+### 3. Output `enc_ciphertext` recomputed per action (memo binding)
+
+cmx recomputation closes recipient + value substitution, but the cmx domain does not cover the memo bytes: a host that has been forced through cmx-recomputation can still embed any 512-byte memo plaintext inside `enc_ciphertext` while showing the user something different on its untrusted UI. The recipient sees the attacker's memo on chain.
+
+`orchard_signer_feed_action_with_note_and_memo(ctx, action, recipient, value, rseed, memo)` therefore additionally recomputes the 580-byte AEAD ciphertext from the unencrypted note plaintext:
+
+```
+g_d          = DiversifyHash(d)
+esk          = ToScalar(PRF^expand(rseed, [0x04] || rho))     // ZIP-212
+epk          = [esk] · g_d
+SharedSecret = [esk] · pk_d
+K_enc        = BLAKE2b("Zcash_OrchardKDF", repr_P(epk) || repr_P(ss))
+np           = leadByte(0x02) || d || value_LE || rseed || memo   // 564 B
+enc_computed = ChaCha20-Poly1305(K_enc, IV=0, np)                 // 580 B
+```
+
+and constant-time compares both `enc_computed` (against the action's `enc_ciphertext` at offset 160) and `repr_P(epk)` (against the action's `ephemeral_key` at offset 128). Mismatch → `SIGNER_ERR_MEMO_MISMATCH`, context reset.
+
+`esk` is **not** carried on the wire. The device re-derives it on-chip from `rseed` (already needed for cmx) + the action's nullifier (= ρ) so the companion has one fewer field to lie about. Equivalent for `pk_d`-decoding failures → `SIGNER_ERR_BAD_PK_D`.
+
+Closes memo substitution; an attacker would have to break ChaCha20-Poly1305 against a per-output key.
+
+### 4. Per-action user confirmation (no blind signing)
 
 cmx recomputation guarantees the cmx commits to *what the companion told the device*. For the user not to be signing blindly, the device must also display recipient + value to the user and the user must explicitly approve. The library lifts that requirement from a firmware convention to a state-machine invariant:
 
@@ -327,6 +353,20 @@ cmx recomputation guarantees the cmx commits to *what the companion told the dev
 - The firmware reads the captured info via `orchard_signer_get_action_display(ctx, idx, recipient_out, value_out)`, encodes the recipient as a Unified Address via `orchard_encode_ua_raw(d, pk_d, hrp)`, displays it on the device UI together with the value, and on user OK calls `orchard_signer_confirm_action(ctx, idx)` to set the confirm flag
 - `orchard_signer_verify()` scans `actions_display[0 .. actions_received)` and returns `SIGNER_ERR_ACTION_NOT_CONFIRMED` if any entry has `confirmed == false`. Only after every action is confirmed does the context transition to `SIGNER_VERIFIED`.
 - `orchard_signer_sign()` already refuses unless `state == SIGNER_VERIFIED`. So a firmware that skipped the confirmation UI gets `NOT_VERIFIED` and no signature.
+
+### 5. Per-transaction fee confirmation (no blind signing for the miner fee)
+
+The same invariant extended to the miner-fee number. cmx + enc_ciphertext recomputation + per-action confirmation make sure the user sees every output the transaction creates; but the *fee* (= value that leaves the wallet but does not appear in any output) is determined by `value_balance`, which is a `TxMeta` field. A host that inflates `value_balance` could silently overspend, siphoning the surplus to miners while displaying a small fee on its own UI.
+
+The device computes the fee on-chip from already-collected data:
+
+```
+fee = transparent_in_total − transparent_out_total + value_balance
+```
+
+with overflow detection at every accumulation step (per-input / per-output sums tracked in `Zip244TransparentState`) and an i64 overflow / negative-fee check on the final combine. The firmware reads the value via `orchard_signer_get_fee()`, renders it on the trusted screen, and only after explicit user OK calls `orchard_signer_confirm_fee()`. `orchard_signer_verify()` returns `SIGNER_ERR_FEE_NOT_CONFIRMED` if confirmation is skipped, `SIGNER_ERR_FEE_OVERFLOW` on arithmetic overflow, and `SIGNER_ERR_FEE_NEGATIVE` if the bundle is unbalanced.
+
+The HWP dispatcher drives this automatically after the per-output review (`ui.review_fee` if the firmware provides it, otherwise a backward-compat fallback to `ui.review_output` with `addr_str = "Network fee"`).
 
 ### Putting it together
 
@@ -340,14 +380,25 @@ orchard_signer_init(&ctx);
 // 1. TxMeta: feed_meta enforces sapling-empty + bounds the action count
 orchard_signer_feed_meta(&ctx, meta_bytes, 125, num_actions);
 
-// 2. Per-action: cmx is recomputed and matched; recipient/value are captured
-for (size_t i = 0; i < num_actions; i++) {
-    orchard_signer_feed_action_with_note(
-        &ctx, action_bytes[i], 820,
-        recipient_bytes[i], value[i], rseed[i]);
+// 2. (Optional) Transparent flow — per-input / per-output digest + value sums
+//    used both for transparent_sig_digest and for the on-device fee math.
+if (has_transparent) {
+    orchard_signer_begin_transparent(&ctx, n_t_in, n_t_out);
+    for (size_t i = 0; i < n_t_in;  i++) orchard_signer_feed_transparent_input (&ctx, t_in [i], len_in [i]);
+    for (size_t i = 0; i < n_t_out; i++) orchard_signer_feed_transparent_output(&ctx, t_out[i], len_out[i]);
+    orchard_signer_verify_transparent(&ctx, expected_transparent_digest);
 }
 
-// 3. Per-output user confirmation — driven by the firmware UI
+// 3. Per-action: cmx + enc_ciphertext + epk are all recomputed and matched;
+//    recipient/value are captured for the UI.
+for (size_t i = 0; i < num_actions; i++) {
+    orchard_signer_feed_action_with_note_and_memo(
+        &ctx, action_bytes[i], 820,
+        recipient_bytes[i], value[i], rseed[i], memo[i]);
+    // (legacy v4 callers can keep using feed_action_with_note — cmx only)
+}
+
+// 4. Per-output user confirmation — driven by the firmware UI
 for (uint16_t i = 0; i < ctx.actions_received; i++) {
     uint8_t recipient[43];
     uint64_t value;
@@ -359,14 +410,24 @@ for (uint16_t i = 0; i < ctx.actions_received; i++) {
     orchard_signer_confirm_action(&ctx, i);
 }
 
-// 4. Verify: refuses if any of [sapling, cmx, confirm, sighash] failed
+// 5. Fee review — compute on-chip, show on the trusted screen, confirm.
+uint64_t fee_zats;
+orchard_signer_get_fee(&ctx, &fee_zats);
+// Display fee_zats to the user, wait for OK ...
+orchard_signer_confirm_fee(&ctx);
+
+// 6. Verify: refuses if any invariant failed
 orchard_signer_verify(&ctx, expected_sighash);
 //   SIGNER_ERR_SAPLING_NOT_EMPTY        — caught at feed_meta
-//   SIGNER_ERR_NOTE_COMMITMENT_MISMATCH — caught at feed_action_with_note
-//   SIGNER_ERR_ACTION_NOT_CONFIRMED     — caught here if user UI skipped
+//   SIGNER_ERR_NOTE_COMMITMENT_MISMATCH — caught at feed_action_with_note*
+//   SIGNER_ERR_MEMO_MISMATCH            — caught at feed_action_with_note_and_memo
+//   SIGNER_ERR_BAD_PK_D                 — caught at feed_action_with_note_and_memo
+//   SIGNER_ERR_ACTION_NOT_CONFIRMED     — caught here if any output not confirmed
+//   SIGNER_ERR_FEE_NOT_CONFIRMED        — caught here if fee not confirmed
+//   SIGNER_ERR_FEE_OVERFLOW / _NEGATIVE — caught at get_fee on hostile values
 //   SIGNER_ERR_SIGHASH_MISMATCH         — caught here on bad sighash
 
-// 5. Sign — refuses with NOT_VERIFIED unless verify() advanced state
+// 7. Sign — refuses with NOT_VERIFIED unless verify() advanced state
 orchard_signer_sign(&ctx, sighash, ask, alpha, sig, rk);
 ```
 
@@ -379,9 +440,15 @@ orchard_signer_sign(&ctx, sighash, ask, alpha, sig, rk);
 | `sapling_digest` | `TxMeta` field | ✅ enforced equal to empty-bundle constant |
 | `orchard_digest` | streamed action data | ✅ recomputed |
 | Per-action `cmx` | streamed action bytes | ✅ recomputed via Sinsemilla from declared note plaintext |
+| Per-action `enc_ciphertext` (incl. **memo**) | streamed action bytes | ✅ recomputed via Pallas ECDH + Orchard KDF + ChaCha20-Poly1305 |
+| Per-action `ephemeral_key` (epk) | streamed action bytes | ✅ recomputed as `[esk]·g_d` |
+| Per-action `esk` | derived on-device | ✅ never on the wire (ZIP-212: `ToScalar(PRF^expand(rseed, [0x04]‖ρ))`) |
 | Per-action recipient (UA) + value | streamed note plaintext | ✅ shown to user; sign refuses unless every output explicitly confirmed |
+| Per-tx miner fee | computed on-device from `t_in − t_out + value_balance` | ✅ shown to user; sign refuses unless fee explicitly confirmed |
+| Anchor, nullifier provenance | streamed action bytes | ❌ no on-MCU recompute; constrained by Halo2 proof soundness |
+| Halo2 proof | companion (prover role) | ❌ not re-verified on-device; a wrong proof produces a tx the network rejects, not one that pays an attacker |
 
-No part of the sighash, the per-action note commitment, or the per-output recipient/value is taken on faith from the companion app.
+The only thing the device trusts the companion for is the Halo2 proof itself — and a wrong proof produces a transaction the network rejects, not one that pays an attacker.
 
 ## Device-side dispatcher (`hwp_dispatcher.h`)
 

@@ -21,9 +21,12 @@ The library does **not** defend against power analysis (DPA/SPA), fault injectio
 | Field multiplication `a * b mod p` | Shift-and-add with `bn_cmov()` conditional add | `src/redpallas.c` fq_mul() | No branching on secret bits |
 | Nonce-is-zero check | `bn_cmov()` replaces zero with 1 | `src/redpallas.c` generate_nonce() | No `if` branch on nonce value |
 | Wide-to-scalar reduction (64B -> 32B) | Horner's method with nibble processing | `src/redpallas.c` fq_from_wide() | Deterministic iteration count |
-| Sighash comparison | `ct_memequal()` (volatile XOR accumulator) | `src/orchard_signer.c` | Defense-in-depth; sighash is public data |
+| Sighash / cmx / enc_ciphertext / epk comparison | `ct_memequal()` (volatile XOR accumulator) | `src/orchard_signer.c` | Sighash is public data, but ct-comparing also memo-bound ciphertexts on the same code path keeps the timing profile uniform across all on-device verification checks |
+| ChaCha20 stream cipher | Pure 32-bit `+`, `^`, rotates; no table lookups | `src/chacha20poly1305.c` | RFC 7539 §2.3 — inherently constant-time |
+| Poly1305 MAC | 26-bit-limb representation (poly1305-donna); branch-free field arithmetic | `src/chacha20poly1305.c` | RFC 7539 §2.5 |
+| ChaCha20-Poly1305 tag check | `ct_memequal_local()` (volatile XOR accumulator, no early-out) | `src/chacha20poly1305.c::chacha20poly1305_decrypt` | Tag verified before any plaintext is written |
 | Memory comparison | `ct_memequal()` | `src/memzero.c` | Volatile accumulator prevents short-circuit |
-| Secret cleanup | `memzero()` via platform-specific secure zeroing | `src/memzero.c` | Resists dead-store elimination |
+| Secret cleanup | `memzero()` via platform-specific secure zeroing | `src/memzero.c` | Resists dead-store elimination; covers the per-output K_enc / esk / np buffer in `orchard_compute_enc_ciphertext` |
 
 ## Non-constant-time operations (justified)
 
@@ -35,7 +38,9 @@ The library does **not** defend against power analysis (DPA/SPA), fault injectio
 
 ## Stack budget
 
-All cryptographic functions stay within a **512-byte per-function** stack limit, verified by GCC `-fstack-usage`. Large intermediates (BLAKE2b state, bignum temporaries, curve points) use `static` storage in BSS and are explicitly zeroed after use.
+All cryptographic functions stay within a **512-byte per-function** stack limit, verified by GCC `-fstack-usage`. Large intermediates (BLAKE2b state, bignum temporaries, curve points, the 564 B note plaintext + 580 B AEAD ciphertext scratch used by `orchard_compute_enc_ciphertext`) use `static` storage in BSS and are explicitly zeroed after use.
+
+The signer state machine is single-threaded per call on every supported MCU, so the `static` pattern does not introduce re-entrancy risks; cross-call leakage is prevented by per-function `memzero()` at every exit path.
 
 Build and verify:
 ```bash
@@ -51,7 +56,7 @@ cmake .. -DSTACK_ANALYSIS=ON && make
 
 ## Test vector corpus
 
-Known-answer tests in `tests/test_vectors.c` cross-check the C implementation against the Rust reference (librustzcash). Coverage (49 tests):
+Known-answer tests in `tests/test_vectors.c` cross-check the C implementation against the Rust reference (librustzcash). Coverage:
 
 - **BLAKE2b** with 5 personalization tags (ZcashIP32Orchard, Zcash_ExpandSeed, Zcash_RedPallasN, Zcash_RedPallasH, ZTxIdOrchardHash)
 - **Pallas hash-to-curve** (3 domain/message pairs including SinsemillaQ)
@@ -62,5 +67,10 @@ Known-answer tests in `tests/test_vectors.c` cross-check the C implementation ag
 - **RedPallas signing** with deterministic nonce (4 test cases: standard, alpha=0, sighash=0, large scalars; compiled with `TEST_DETERMINISTIC_NONCE`)
 - **Sinsemilla end-to-end** (HashToPoint with 1 and 2 chunks, ShortCommit with synthetic 510-bit message, ShortCommit with real ak||nk and rivk from ZIP-32)
 - **F4Jumble** forward (3 test cases: 48, 83, and 128 bytes) + inverse round-trip
+- **ChaCha20-Poly1305** RFC 7539 §A.5 reference vector + tamper-detection round-trip (`chacha20poly1305_self_test()`, invoked from `test_orchard`)
+- **`orchard_compute_enc_ciphertext`** consistency (signer test fixture in `tests/test_signer.c`): per-action recomputed `enc_ciphertext` + `epk` vs. on-action bytes, with positive and tamper-rejection cases (memo / rseed / enc_ciphertext bit-flips → `SIGNER_ERR_MEMO_MISMATCH` or `_NOTE_COMMITMENT_MISMATCH`)
+- **Miner-fee math** (`tests/test_signer.c`): Orchard-only fee == value_balance, caching, negative-fee rejection, fee-confirmation gate
+
+The whole test suite must run with assertions enabled. Release-mode builds (`-DNDEBUG`) silently turn `assert()` into a no-op; the test executables therefore force `-UNDEBUG` (see `tests/CMakeLists.txt`) so a broken invariant fails loudly rather than passing on a stripped binary.
 
 Regenerate vectors: `cd tools/gen_test_vectors && cargo run 2>/dev/null > ../../tests/test_vectors.h`
